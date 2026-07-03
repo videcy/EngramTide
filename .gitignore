@@ -1,0 +1,20 @@
+# 环境变量（含 API Key）
+.env
+
+# Python 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# pytest 缓存
+.pytest_cache/
+pytest-cache-files-*/
+
+# IDE
+.vscode/
+.idea/
+
+# 数据库文件（可选：如需保留种子数据则去掉下行）
+data/*.db
