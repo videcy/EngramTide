@@ -1,11 +1,11 @@
 """
-Phase 2 — 类型感知衰减引擎与浮现机制。
+Phase 2+3 — 类型感知衰减引擎、浮现机制与逐轮激活。
 
 设计约束：
 - 纯数学计算，不调用任何外部 API。
-- semantic / procedural 永不衰减。
+- semantic / procedural 永不衰减/不参与激活。
 - 时间一律使用 aware UTC（utils.time_utils）。
-- Phase 3 的 context_aware_update() 将挂载在本模块（见文件尾部预留注释）。
+- 衰减是乘法通道（会话开始一次），激活是加法通道（逐轮）。
 """
 
 import logging
@@ -17,6 +17,7 @@ from config import (
     BASE_DECAY_RATE,
     DECAY_FLOOR,
     EMOTIONAL_DECAY_FACTOR,
+    MAX_ACTIVATIONS_PER_TURN,
     MAX_SURFACED_MEMORIES,
     SURFACE_AROUSAL_THRESHOLD,
     SURFACE_EMOTIONAL_MIN_DECAY,
@@ -28,6 +29,7 @@ from core.memory_store import (
     Memory,
     get_meta,
     list_active_memories,
+    mark_accessed,
     set_meta,
     update_decay_weights,
 )
@@ -332,7 +334,203 @@ def get_surfaced_memories(
     return result
 
 
-# ── Phase 3 预留 ──────────────────────────────────────────
-# def context_aware_update(current_embedding, memories) -> list[tuple[str, float]]:
-#     每轮用户输入后调用；相似度 > SIMILARITY_HIGH 强激活（+ACTIVATION_HIGH），
-#     > SIMILARITY_MID 轻激活（+ACTIVATION_MID）。参数届时进 config.py。
+# ── Phase 3：Context-Aware 逐轮激活 ────────────────────────
+
+
+@dataclass
+class ActivationDetail:
+    """单条记忆的激活明细，供 /debug activation 逐条展示。"""
+
+    memory_id: str
+    content: str      # 记忆内容（供人读，展示时截断）
+    sim: float        # 与当前输入的余弦相似度
+    old_weight: float # 激活前 decay_weight
+    new_weight: float # 激活后 decay_weight
+    is_strong: bool   # 是否强激活
+
+
+@dataclass
+class ActivationReport:
+    """一轮激活的摘要，供逐轮日志、/debug activation 与对比实验断言。"""
+
+    considered: int = 0    # 参与相似度比较的记忆条数（episodic/emotional 且有 embedding）
+    strong: int = 0        # 强激活条数（sim > SIMILARITY_HIGH）
+    mild: int = 0          # 轻激活条数（SIMILARITY_MID < sim <= SIMILARITY_HIGH）
+    reactivated: int = 0   # 唤醒条数：权重从 < RETRIEVAL_MIN_DECAY 跨回 >= RETRIEVAL_MIN_DECAY
+    capped: int = 0        # 因 MAX_ACTIVATIONS_PER_TURN 被丢弃的激活条数
+    mild_suppressed: int = 0  # Phase 4：因会话上限被抑制的轻激活条数
+    strong_ids: list[str] = None  # type: ignore — 在 __post_init__ 中初始化
+    mild_ids: list[str] = None    # type: ignore — Phase 4：本轮实际轻激活的 memory_id
+    details: list[ActivationDetail] = None  # type: ignore — 逐条明细，按相似度降序
+
+    def __post_init__(self):
+        if self.strong_ids is None:
+            self.strong_ids = []
+        if self.mild_ids is None:
+            self.mild_ids = []
+        if self.details is None:
+            self.details = []
+
+
+def compute_activations(
+    query_embedding,
+    memories: list[Memory],
+    max_activations: int = MAX_ACTIVATIONS_PER_TURN,
+    exclude_mild_ids: frozenset[str] = frozenset(),
+) -> tuple[list[tuple[str, float, bool]], ActivationReport]:
+    """
+    对内存中的记忆列表计算激活（不落库、不修改传入对象）。
+
+    返回 (activations, report)：
+    - activations: [(memory_id, new_weight, is_strong)]，按相似度降序；
+    - is_strong 标记该条是否为强激活（决定是否计访问）。
+
+    规则：
+    - semantic / procedural / 未知类型 → 跳过（权重恒 1.0 不变量）。
+    - superseded_by 非空 → 跳过。
+    - embedding 为 None → 跳过。
+    - sim > SIMILARITY_HIGH        → new_weight = min(1.0, w + ACTIVATION_HIGH), is_strong=True
+    - SIMILARITY_MID < sim         → new_weight = min(1.0, w + ACTIVATION_MID), is_strong=False
+    - 已封顶 1.0 且命中强激活 → 仍产出条目（is_strong=True, new_weight=1.0），供调用方计访问。
+    - 候选超过 max_activations 时按相似度降序截断。
+    - Phase 4：memory_id ∈ exclude_mild_ids 且命中轻激活带 → 跳过（会话上限）；
+      强激活带不受排除集影响。抑制发生在 max_activations 截断**之前**，
+      被抑制条目不占用激活槽位。
+    """
+    from config import (
+        ACTIVATION_HIGH,
+        ACTIVATION_MID,
+        RETRIEVAL_MIN_DECAY,
+        SIMILARITY_HIGH,
+        SIMILARITY_MID,
+    )
+    from utils.similarity import cosine_similarity
+
+    if query_embedding is None:
+        return ([], ActivationReport())
+
+    # 收集候选（episodic / emotional，有 embedding，未 superseded）
+    # Phase 4：轻激活带命中排除集 → 在截断之前剔除，被抑制条目不占 max_activations 槽位
+    mild_suppressed = 0
+    candidates: list[tuple[Memory, float]] = []
+    for mem in memories:
+        if mem.type in _STATIC_TYPES:
+            continue
+        if mem.superseded_by is not None:
+            continue
+        if mem.embedding is None:
+            continue
+        sim = cosine_similarity(query_embedding, mem.embedding)
+        if sim > SIMILARITY_MID:
+            if sim <= SIMILARITY_HIGH and mem.memory_id in exclude_mild_ids:
+                mild_suppressed += 1
+                continue
+            candidates.append((mem, sim))
+
+    report = ActivationReport(
+        considered=len([m for m in memories
+            if m.type not in _STATIC_TYPES and m.superseded_by is None and m.embedding is not None]),
+        mild_suppressed=mild_suppressed,
+    )
+
+    if not candidates:
+        return ([], report)
+
+    # 按相似度降序
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    capped = max(0, len(candidates) - max_activations)
+    candidates = candidates[:max_activations]
+
+    activations: list[tuple[str, float, bool]] = []
+    for mem, sim in candidates:
+        old_w = mem.decay_weight
+
+        if sim > SIMILARITY_HIGH:
+            new_w = min(1.0, old_w + ACTIVATION_HIGH)
+            is_strong = True
+        else:
+            # SIMILARITY_MID < sim <= SIMILARITY_HIGH
+            new_w = min(1.0, old_w + ACTIVATION_MID)
+            is_strong = False
+
+        # 权重无变化且非强激活 → 不产出条目
+        if abs(new_w - old_w) < 1e-12 and not is_strong:
+            continue
+
+        # 强激活即使权重已封顶也产出（供计访问）
+        activations.append((mem.memory_id, new_w, is_strong))
+        report.details.append(
+            ActivationDetail(
+                memory_id=mem.memory_id,
+                content=mem.content,
+                sim=sim,
+                old_weight=old_w,
+                new_weight=new_w,
+                is_strong=is_strong,
+            )
+        )
+
+        if is_strong:
+            report.strong += 1
+        else:
+            report.mild += 1
+            report.mild_ids.append(mem.memory_id)
+
+        # 唤醒检测：从 < RETRIEVAL_MIN_DECAY 跨回 >= RETRIEVAL_MIN_DECAY
+        if old_w < RETRIEVAL_MIN_DECAY and new_w >= RETRIEVAL_MIN_DECAY:
+            report.reactivated += 1
+
+    report.capped = capped
+    report.strong_ids = [mid for (mid, _, is_strong) in activations if is_strong]
+
+    return (activations, report)
+
+
+def context_aware_update(
+    query_embedding,
+    memories: list[Memory] | None = None,
+    exclude_mild_ids: frozenset[str] = frozenset(),
+) -> ActivationReport:
+    """
+    每轮用户输入后、检索之前调用一次。
+
+    流程：
+    1. CONTEXT_AWARE_ENABLED 为 False → 直接返回空 report。
+    2. memories = memories or list_active_memories()
+    3. activations, report = compute_activations(query_embedding, memories, exclude_mild_ids=exclude_mild_ids)
+    4. 权重变化的条目 → update_decay_weights
+    5. 强激活条目 → mark_accessed
+    """
+    from config import CONTEXT_AWARE_ENABLED
+
+    if not CONTEXT_AWARE_ENABLED:
+        return ActivationReport()
+
+    if memories is None:
+        memories = list_active_memories()
+
+    activations, report = compute_activations(
+        query_embedding, memories, exclude_mild_ids=exclude_mild_ids
+    )
+
+    if not activations:
+        return report
+
+    # 分离：权重实际变化的 vs 仅计访问的。
+    # compute_activations 会为"已封顶 1.0 的强激活"产出条目（new_w == old_w）以驱动计访问，
+    # 这类条目不应写回权重——用 details 里的 old_weight 精确过滤掉无变化条，避免冗余空写。
+    old_by_id = {d.memory_id: d.old_weight for d in report.details}
+    weight_updates: list[tuple[float, str]] = [
+        (new_w, mid)
+        for mid, new_w, _ in activations
+        if abs(new_w - old_by_id.get(mid, new_w)) > 1e-12
+    ]
+
+    if weight_updates:
+        update_decay_weights(weight_updates)
+
+    # 强激活计访问
+    if report.strong_ids:
+        mark_accessed(report.strong_ids)
+
+    return report

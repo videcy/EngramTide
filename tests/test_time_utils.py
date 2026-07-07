@@ -111,8 +111,9 @@ class TestUtcNow:
         assert now.tzinfo == timezone.utc
 
     def test_returns_current_time(self):
-        now = utc_now()
+        # before 必须在 utc_now() 之前取样，否则时钟前进时 before > now 造成 flaky 失败
         before = datetime.now(timezone.utc)
+        now = utc_now()
         after = datetime.now(timezone.utc)
         # 在调用前后范围内
         assert before <= now <= after

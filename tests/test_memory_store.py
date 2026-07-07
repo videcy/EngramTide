@@ -75,6 +75,33 @@ def test_insert_and_read_one_memory():
     assert all_mem[0].type == "semantic"
 
 
+def test_insert_preserves_access_count():
+    """回归（Phase 4 合并 bug）：insert_memory 必须落库 access_count，
+    否则合并记忆的访问历史归零、衰减减速因子失效。"""
+    mem = Memory(
+        memory_id=str(uuid.uuid4()),
+        type="episodic",
+        content="带访问历史的记忆",
+        access_count=7,
+    )
+    insert_memory(mem)
+
+    loaded = list_active_memories()[0]
+    assert loaded.access_count == 7
+
+    # 带显式时间戳的插入路径（INSERT_WITH_TIME_SQL）同样保持
+    mem2 = Memory(
+        memory_id=str(uuid.uuid4()),
+        type="episodic",
+        content="带时间戳与访问历史的记忆",
+        access_count=5,
+        created_at="2026-01-01 00:00:00",
+    )
+    insert_memory(mem2)
+    loaded2 = [m for m in list_active_memories() if m.memory_id == mem2.memory_id][0]
+    assert loaded2.access_count == 5
+
+
 def test_insert_memories_batch():
     """批量插入多条记忆。"""
     mems = [

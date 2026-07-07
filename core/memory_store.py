@@ -66,20 +66,20 @@ CREATE INDEX IF NOT EXISTS idx_memories_type
 INSERT_SQL = """
 INSERT INTO memories
     (memory_id, type, content, valence, arousal,
-     decay_weight, embedding, source_conv_id,
+     access_count, decay_weight, embedding, source_conv_id,
      unresolved, tags, superseded_by)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 INSERT_WITH_TIME_SQL = """
 INSERT INTO memories
     (memory_id, type, content, valence, arousal,
      created_at, last_accessed,
-     decay_weight, embedding, source_conv_id,
+     access_count, decay_weight, embedding, source_conv_id,
      unresolved, tags, superseded_by)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 SELECT_ACTIVE_SQL = """
@@ -213,6 +213,7 @@ def insert_memory(memory: Memory) -> None:
                 memory.arousal,
                 memory.created_at or None,  # None → DB 使用 DEFAULT
                 memory.last_accessed or None,
+                memory.access_count,
                 memory.decay_weight,
                 embedding_blob,
                 memory.source_conv_id,
@@ -230,6 +231,7 @@ def insert_memory(memory: Memory) -> None:
                 memory.content,
                 memory.valence,
                 memory.arousal,
+                memory.access_count,
                 memory.decay_weight,
                 embedding_blob,
                 memory.source_conv_id,

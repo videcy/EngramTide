@@ -381,7 +381,7 @@ class TestEndToEndLoop:
         retrieved = retrieve_memories(query_emb, top_k=3)
         memory_context = build_constitutional_memory_context(
             retrieved,
-            max_chars=12,
+            max_tokens=8,
         )
         mark_accessed(memory_context.included_memory_ids)
 
@@ -447,3 +447,568 @@ class TestConfig:
 
         errors = check_config()
         assert len(errors) == 0
+
+
+# ════════════════════════════════════════════════════════════
+# Phase 3：检索契约测试 — 激活后当轮可见
+# ════════════════════════════════════════════════════════════
+
+class TestActivationRetrievalContract:
+    """
+    契约：retrieve_memories(memories=None) 每次都从 DB 新读，
+    因此 context_aware_update 落库后，同一轮的检索立即可见。
+    """
+
+    def test_activated_memory_visible_in_same_turn(self, fake_embedding):
+        """激活落库后当轮检索可见（休眠唤醒闭环的关键前提）。"""
+        import numpy as np
+
+        from core.memory_store import update_decay_weights
+        from core.retriever import retrieve_memories
+
+        # 插入一条沉底记忆（decay_weight < 0.1，正常检索不可见）
+        mid = str(uuid.uuid4())
+        content = "用户在准备字节跳动的实习面试"
+        emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        insert_memory(
+            Memory(
+                memory_id=mid,
+                type="episodic",
+                content=content,
+                embedding=emb,
+                decay_weight=0.05,
+            )
+        )
+
+        # 验证：沉底记忆检索不到
+        query_similar = np.array([0.9, 0.1, 0.0], dtype=np.float32)
+        results_before = retrieve_memories(query_similar, top_k=5)
+        assert len(results_before) == 0  # decay_weight 0.05 < 0.1，被过滤
+
+        # 模拟激活：手动提升权重（等价于 context_aware_update 的效果）
+        update_decay_weights([(0.25, mid)])
+
+        # 验证：同一轮内检索可见
+        results_after = retrieve_memories(query_similar, top_k=5)
+        assert len(results_after) == 1
+        assert results_after[0][0].content == content
+
+    def test_context_aware_update_end_to_end_reactivation(self):
+        """场景 E 全闭环（§8.2）：真正经由 context_aware_update 唤醒沉底记忆。
+
+        插入 w=0.05 的沉底记忆 → 检索不可见 → context_aware_update
+        → report.strong==1 且 reactivated==1 → 当轮检索可见
+        → 数据库读回 w≈0.25、access_count==1。
+        """
+        from core.decay import context_aware_update
+
+        emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        mid = str(uuid.uuid4())
+        insert_memory(
+            Memory(
+                memory_id=mid,
+                type="episodic",
+                content="用户在准备字节跳动的实习面试",
+                embedding=emb,
+                decay_weight=0.05,
+            )
+        )
+
+        # 沉底：检索不可见
+        assert retrieve_memories(emb, top_k=5) == []
+
+        # 激活（相同向量 → sim=1.0 强激活）
+        report = context_aware_update(emb)
+        assert report.strong == 1
+        assert report.reactivated == 1
+
+        # 当轮检索可见
+        results = retrieve_memories(emb, top_k=5)
+        assert [m.memory_id for m, _ in results] == [mid]
+
+        # 数据库读回：权重与访问计数已持久化
+        mem = [m for m in list_active_memories() if m.memory_id == mid][0]
+        assert mem.decay_weight == pytest.approx(0.25)  # 0.05 + 0.2
+        assert mem.access_count == 1
+
+
+class TestAblationEquivalence:
+    """场景 F（§8.2）：CONTEXT_AWARE_ENABLED=False 时，同一固定脚本产生的
+    数据库状态与"从未调用激活"逐字段一致（§2 最低验收指标：消融等价性）。"""
+
+    _FIXED_TS = "2026-01-01 00:00:00"
+
+    def _seed_bank(self):
+        """固定 memory_id 与时间戳的记忆库（两次运行逐字段可比的前提）。"""
+        specs = [
+            ("m-epi-sunk", "episodic", "沉底情节", 0.05, [1.0, 0.0, 0.0], 0.0),
+            ("m-epi-live", "episodic", "活跃情节", 0.80, [1.0, 0.1, 0.0], 0.0),
+            ("m-emo", "emotional", "情绪记忆", 0.50, [0.0, 1.0, 0.0], 0.9),
+            ("m-sem", "semantic", "语义事实", 1.00, [1.0, 0.0, 0.0], 0.0),
+            ("m-proc", "procedural", "行为偏好", 1.00, [0.0, 1.0, 0.0], 0.0),
+        ]
+        for mid, mtype, content, weight, emb, arousal in specs:
+            insert_memory(
+                Memory(
+                    memory_id=mid,
+                    type=mtype,
+                    content=content,
+                    decay_weight=weight,
+                    embedding=np.array(emb, dtype=np.float32),
+                    arousal=arousal,
+                    created_at=self._FIXED_TS,
+                    last_accessed=self._FIXED_TS,
+                )
+            )
+
+    def _run_script(self, db_path, call_activation: bool):
+        """固定脚本：建库 → 记衰减基准 → [3 轮激活调用] → 48h 后衰减 → dump 全表。"""
+        from datetime import datetime, timedelta, timezone
+
+        import core.memory_store as ms
+        from core.decay import context_aware_update, run_decay_update
+
+        ms.close_db()
+        ms.DB_PATH = db_path  # autouse fixture 的 monkeypatch 会在测试结束后还原
+        init_db()
+        self._seed_bank()
+
+        t0 = datetime(2026, 1, 2, 12, 0, 0, tzinfo=timezone.utc)
+        run_decay_update(now=t0)  # 首次运行：只记基准，不衰减
+        if call_activation:
+            for q in ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]):
+                context_aware_update(np.array(q, dtype=np.float32))
+        run_decay_update(now=t0 + timedelta(hours=48))
+
+        conn = ms._get_conn()
+        mem_rows = [tuple(r) for r in conn.execute(
+            "SELECT * FROM memories ORDER BY memory_id").fetchall()]
+        meta_rows = [tuple(r) for r in conn.execute(
+            "SELECT * FROM meta ORDER BY key").fetchall()]
+        return mem_rows, meta_rows
+
+    def test_disabled_equals_never_called(self, monkeypatch, tmp_path):
+        """开关关闭 + 逐轮调用激活 ≡ 从未调用激活（数据库逐字段一致）。"""
+        control = self._run_script(tmp_path / "control.db", call_activation=False)
+        monkeypatch.setattr("config.CONTEXT_AWARE_ENABLED", False)
+        ablated = self._run_script(tmp_path / "ablated.db", call_activation=True)
+        assert ablated == control
+
+    def test_enabled_actually_diverges(self, monkeypatch, tmp_path):
+        """自检：开关开启时同一脚本必须产生不同状态（防场景 F 空转通过）。"""
+        control = self._run_script(tmp_path / "control2.db", call_activation=False)
+        monkeypatch.setattr("config.CONTEXT_AWARE_ENABLED", True)
+        enabled = self._run_script(tmp_path / "enabled.db", call_activation=True)
+        assert enabled != control
+
+
+class TestAccessCountThreeWayDedup:
+    """场景 G（§8.2）：同一条记忆同一轮"浮现 + 强激活 + 检索 Top-K"，
+    该轮 access_count 净增恰为 1（激活侧）；浮现的会话级 +1 单独发生。
+
+    复刻 main.py 的调用序列语义（§5.5 访问计数表），把三路去重固定为契约。
+    """
+
+    def test_same_turn_net_increment_is_one(self):
+        from core.decay import context_aware_update
+
+        v = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        star_id = str(uuid.uuid4())
+        insert_memory(
+            Memory(memory_id=star_id, type="episodic", content="三路计数",
+                   decay_weight=0.5, embedding=v)
+        )
+        # 对照：只走检索通道的轻激活带记忆（sim=0.6）
+        mild_id = str(uuid.uuid4())
+        insert_memory(
+            Memory(memory_id=mild_id, type="episodic", content="轻激活带",
+                   decay_weight=1.0,
+                   embedding=np.array([0.6, 0.8, 0.0], dtype=np.float32))
+        )
+
+        # ① 会话开始：浮现记忆会话级计 1 次（main.py 会话初始化语义）
+        surfaced_ids = {star_id}
+        mark_accessed(list(surfaced_ids))
+
+        # ② 本轮：逐轮激活（强激活在 context_aware_update 内部计 1 次）
+        report = context_aware_update(v)
+        assert star_id in report.strong_ids
+        assert mild_id not in report.strong_ids  # sim=0.6 → 只轻激活
+
+        # ③ 检索进入上下文
+        retrieved_ids = [m.memory_id for m, _ in retrieve_memories(v, top_k=5)]
+        assert star_id in retrieved_ids
+        assert mild_id in retrieved_ids
+
+        # ④ 逐轮计数：排除浮现与本轮强激活（main.py 三路去重语义）
+        mark_accessed([
+            mid for mid in retrieved_ids
+            if mid not in surfaced_ids and mid not in report.strong_ids
+        ])
+
+        counts = {m.memory_id: m.access_count for m in list_active_memories()}
+        # 三路来源的记忆：会话级 1 + 本轮净 1 = 2（若不去重会是 3）
+        assert counts[star_id] == 2
+        # 轻激活不计数：只通过检索通道计 1 次
+        assert counts[mild_id] == 1
+
+
+# ════════════════════════════════════════════════════════════
+# Phase 4：话题分割测试
+# ════════════════════════════════════════════════════════════
+
+
+class TestTopicSplitValidation:
+    """索引完整性校验纯函数测试。"""
+
+    def test_valid_two_segments(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 4}, {"start": 5, "end": 9}],
+            total_messages=10,
+        )
+        assert err is None
+
+    def test_valid_single_segment(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 9}],
+            total_messages=10,
+        )
+        assert err is None
+
+    def test_first_not_zero(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 1, "end": 9}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_last_not_end(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 4}, {"start": 5, "end": 8}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_gap_between_segments(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 3}, {"start": 5, "end": 9}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_overlap_between_segments(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 5}, {"start": 4, "end": 9}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_start_greater_than_end(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 5, "end": 0}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_out_of_bounds(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": 10}],
+            total_messages=10,
+        )
+        assert err is not None
+
+    def test_empty_segments(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices([], total_messages=5)
+        assert err is not None
+
+    def test_non_integer_indices(self):
+        from core.dehydrator import _validate_segment_indices
+        err = _validate_segment_indices(
+            [{"start": 0, "end": "abc"}],
+            total_messages=5,
+        )
+        assert err is not None
+
+
+class TestTopicSplitIntegration:
+    """话题分割端到端（fake LLM）。"""
+
+    @pytest.mark.asyncio
+    async def test_split_two_topics(self, monkeypatch, fake_embedding):
+        """模拟 LLM 返回 2 段分割 → 数据库两组记忆。"""
+        import httpx
+        from core.dehydrator import split_conversation
+
+        # 构造 6 条消息
+        messages = []
+        for i in range(6):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"消息{i}"})
+
+        # fake LLM：返回两段 [0,2] [3,5]
+        class FakeSplitResponse:
+            status_code = 200
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": json.dumps([
+                        {"start": 0, "end": 2},
+                        {"start": 3, "end": 5},
+                    ])}}]
+                }
+            @property
+            def request(self): return None
+            @property
+            def text(self): return json.dumps(self.json())
+
+        original_post = httpx.AsyncClient.post
+
+        async def _patched(self, *args, **kwargs):
+            url = args[0] if args else kwargs.get("url", "")
+            if "/v1/embeddings" in url:
+                raise RuntimeError("不应调用 embedding")
+            return FakeSplitResponse()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _patched)
+
+        segments, report = await split_conversation(messages)
+        assert report.attempted is True
+        assert report.fell_back is False
+        assert report.segments == 2
+        assert len(segments) == 2
+        assert len(segments[0]) == 3  # [0,1,2]
+        assert len(segments[1]) == 3  # [3,4,5]
+
+    @pytest.mark.asyncio
+    async def test_split_invalid_indices_falls_back(self, monkeypatch, fake_embedding):
+        """LLM 返回越界索引 → 整段回退，segments=1。"""
+        import httpx
+        from core.dehydrator import split_conversation
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "topic change"},
+        ]
+
+        class FakeBadResponse:
+            status_code = 200
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": json.dumps([
+                        {"start": 0, "end": 5},  # 越界！
+                    ])}}]
+                }
+            @property
+            def request(self): return None
+            @property
+            def text(self): return json.dumps(self.json())
+
+        async def _bad_post(self, *args, **kwargs):
+            return FakeBadResponse()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _bad_post)
+
+        segments, report = await split_conversation(messages)
+        assert report.fell_back is True
+        assert report.segments == 1
+        assert "索引" in report.reason
+        # 回退后 segments 是完整消息列表
+        assert len(segments) == 1
+        assert len(segments[0]) == 3
+
+    @pytest.mark.asyncio
+    async def test_short_conversation_skips_split(self, fake_embedding):
+        """消息数 < MIN_SEGMENT_MESSAGES → 不调 LLM。"""
+        from core.dehydrator import split_conversation
+
+        messages = [{"role": "user", "content": "hi"}]
+        segments, report = await split_conversation(messages)
+        assert report.attempted is False
+        assert report.segments == 1
+        assert len(segments) == 1
+        assert len(segments[0]) == 1
+
+    @pytest.mark.asyncio
+    async def test_split_disabled_by_env(self, monkeypatch, fake_embedding):
+        """TOPIC_SPLIT_ENABLED=False → 不分割。"""
+        monkeypatch.setattr("core.dehydrator.TOPIC_SPLIT_ENABLED", False)
+        from core.dehydrator import split_conversation
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        segments, report = await split_conversation(messages)
+        assert report.attempted is False
+        assert report.segments == 1
+        assert len(segments) == 1
+        assert len(segments[0]) == 2
+
+    @pytest.mark.asyncio
+    async def test_split_llm_failure_falls_back(self, monkeypatch, fake_embedding):
+        """LLM 调用抛异常 → 整段回退，记忆不丢失。"""
+        import httpx
+        from core.dehydrator import split_conversation
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "change"},
+        ]
+
+        async def _failing_post(self, *args, **kwargs):
+            raise httpx.TimeoutException("timeout")
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _failing_post)
+
+        segments, report = await split_conversation(messages)
+        assert report.fell_back is True
+        assert report.segments == 1
+        assert "LLM 调用失败" in report.reason
+        # 所有消息都在
+        assert len(segments) == 1
+        assert len(segments[0]) == 3
+
+    @pytest.mark.asyncio
+    async def test_split_invalid_json_falls_back(self, monkeypatch, fake_embedding):
+        """LLM 返回非 JSON → 回退。"""
+        import httpx
+        from core.dehydrator import split_conversation
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+
+        class FakeNonJsonResponse:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": "这不是 JSON"}}]}
+            @property
+            def request(self): return None
+            @property
+            def text(self): return ""
+
+        async def _nonjson_post(self, *args, **kwargs):
+            return FakeNonJsonResponse()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _nonjson_post)
+
+        segments, report = await split_conversation(messages)
+        assert report.fell_back is True
+        assert "JSON" in report.reason
+        assert report.segments == 1
+
+
+# ════════════════════════════════════════════════════════════
+# Phase 4 Bug 修复回归：分段脱水逐段容错
+# ════════════════════════════════════════════════════════════
+
+
+class TestSegmentFaultTolerance:
+    """单段脱水失败不牵连其余段（§10 记忆零丢失）；全部段失败时维持 Phase 3 失败语义。"""
+
+    @staticmethod
+    def _six_messages():
+        messages = []
+        for i in range(6):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"消息{i}"})
+        return messages
+
+    @staticmethod
+    def _patch_llm(monkeypatch, fail_segments: set):
+        """fake LLM：分割调用返回 2 段；第 n 次段脱水调用按 fail_segments 决定成败。"""
+        import httpx
+
+        state = {"dehydrate_calls": 0}
+
+        class _Resp:
+            def __init__(self, content: str, status: int = 200):
+                self.status_code = status
+                self._content = content
+
+            def json(self):
+                return {"choices": [{"message": {"content": self._content}}]}
+
+            @property
+            def request(self):
+                return None
+
+            @property
+            def text(self):
+                return self._content
+
+        async def _post(self, *args, **kwargs):
+            payload = kwargs.get("json") or {}
+            msgs = payload.get("messages", [])
+            user_msg = msgs[-1].get("content", "") if msgs else ""
+            if "对话共有" in user_msg:
+                # 话题分割调用 → 两段 [0,2] [3,5]
+                return _Resp(json.dumps([
+                    {"start": 0, "end": 2},
+                    {"start": 3, "end": 5},
+                ]))
+            # 段脱水调用
+            state["dehydrate_calls"] += 1
+            n = state["dehydrate_calls"]
+            if n in fail_segments:
+                return _Resp("Internal Server Error", status=500)
+            return _Resp(json.dumps([
+                {"content": f"话题{n}的记忆", "type": "episodic"},
+            ]))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_partial_segment_failure_keeps_other_segments(
+        self, monkeypatch, fake_embedding
+    ):
+        """第 2 段脱水失败 → 第 1 段的记忆仍然保留（不再全有全无）。"""
+        from core.dehydrator import dehydrate_conversation
+
+        state = self._patch_llm(monkeypatch, fail_segments={2})
+        memories, split_report = await dehydrate_conversation(
+            self._six_messages(), "conv-ft-1"
+        )
+
+        assert state["dehydrate_calls"] == 2      # 两段都尝试过
+        assert len(memories) == 1                 # 只有成功段的产出
+        assert memories[0].content == "话题1的记忆"
+        assert split_report.segments == 2         # SplitReport 一并返回（计划 §5.2）
+        assert split_report.fell_back is False
+
+    @pytest.mark.asyncio
+    async def test_first_segment_failure_keeps_later_segments(
+        self, monkeypatch, fake_embedding
+    ):
+        """第 1 段失败也不阻断第 2 段（失败不中断循环）。"""
+        from core.dehydrator import dehydrate_conversation
+
+        state = self._patch_llm(monkeypatch, fail_segments={1})
+        memories, _ = await dehydrate_conversation(self._six_messages(), "conv-ft-2")
+
+        assert state["dehydrate_calls"] == 2
+        assert len(memories) == 1
+        assert memories[0].content == "话题2的记忆"
+
+    @pytest.mark.asyncio
+    async def test_all_segments_fail_raises(self, monkeypatch, fake_embedding):
+        """全部段失败 → 向上抛出（调用方按既有路径统一报告，与 Phase 3 语义一致）。"""
+        import httpx
+
+        from core.dehydrator import dehydrate_conversation
+
+        self._patch_llm(monkeypatch, fail_segments={1, 2})
+        with pytest.raises(httpx.HTTPStatusError):
+            await dehydrate_conversation(self._six_messages(), "conv-ft-3")

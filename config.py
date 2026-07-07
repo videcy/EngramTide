@@ -54,7 +54,6 @@ EMBEDDING_MODEL: str = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
 # ── 检索与记忆参数 ────────────────────────────────────────
 
 TOP_K_RETRIEVE: int = 5
-MAX_MEMORY_CONTEXT_CHARS: int = 4000
 MAX_HISTORY_MESSAGES: int = 20
 DEHYDRATE_MAX_ITEMS: int = 8
 REQUEST_TIMEOUT_SECONDS: int = 60
@@ -89,6 +88,58 @@ EMOTIONAL_REINFORCE_BOOST: float = 0.2       # 强化时 decay_weight 提升量
 PROCEDURAL_DEDUP_THRESHOLD: float = 0.90     # procedural 写入去重相似度阈值
 
 
+# ── Context-Aware 激活参数（Phase 3）────────────────────────
+
+CONTEXT_AWARE_ENABLED: bool = (
+    _get_env("CONTEXT_AWARE_ENABLED", "true").lower() != "false"
+)  # ★ 总开关：false 时逐轮激活完全关闭（消融/回退用）
+
+# 阈值经真实 embedding 校准定标（notebook §8，2026-07-07）：
+# 无关对 P95=0.588 < MID < 相关对 P25=0.851；MID 取间隙中点，HIGH 取相关对 P25。
+SIMILARITY_HIGH: float = 0.85           # 强激活相似度阈值（严格大于），由 0.7 校准为 0.85
+SIMILARITY_MID: float = 0.72            # 轻激活相似度阈值（严格大于），由 0.4 校准为 0.72
+ACTIVATION_HIGH: float = 0.2            # 强激活时 decay_weight 回升量
+ACTIVATION_MID: float = 0.05            # 轻激活时 decay_weight 回升量
+MAX_ACTIVATIONS_PER_TURN: int = 30      # ★ 单轮最多激活条数（按相似度降序保留）
+
+
+# ── 话题分割参数（Phase 4）──────────────────────────────────
+
+TOPIC_SPLIT_ENABLED: bool = (
+    _get_env("TOPIC_SPLIT_ENABLED", "true").lower() != "false"
+)                                       # ★ false 时整段脱水（Phase 3 等价）
+MAX_TOPIC_SEGMENTS: int = 8             # 单会话最多分割段数（超出合并尾段，防 LLM 过度切分）
+MIN_SEGMENT_MESSAGES: int = 2           # 少于该消息数的会话不分割（省 1 次 LLM 调用）
+
+# ── 双通道检索参数（Phase 4）────────────────────────────────
+
+KEYWORD_CHANNEL_ENABLED: bool = (
+    _get_env("KEYWORD_CHANNEL_ENABLED", "true").lower() != "false"
+)                                       # ★ false 时纯向量检索（Phase 3 等价）
+RETRIEVAL_VECTOR_WEIGHT: float = 0.7    # 向量通道权重（总文档 §4.3.1）
+RETRIEVAL_KEYWORD_WEIGHT: float = 0.3   # 关键词通道权重
+
+# ── Token 预算参数（Phase 4，取代 MAX_MEMORY_CONTEXT_CHARS）──
+
+MAX_CONTEXT_TOKENS: int = 1500          # 记忆上下文的 token 预算（总文档 §七）
+TOKEN_EST_CJK: float = 0.6              # 每 CJK 字符的估算 token（DeepSeek 官方口径）
+TOKEN_EST_OTHER: float = 0.3            # 每非 CJK 字符的估算 token
+TOKEN_EST_SAFETY: float = 1.1           # 安全系数（估算宁高勿低）
+
+# ── 激活会话上限（Phase 4）──────────────────────────────────
+
+MILD_ONCE_PER_SESSION: bool = (
+    _get_env("MILD_ONCE_PER_SESSION", "true").lower() != "false"
+)                                       # ★ false 时轻激活无会话上限（Phase 3 等价/消融）
+
+# ── 记忆合并参数（Phase 4）──────────────────────────────────
+
+CONSOLIDATE_SIMILARITY: float = 0.92    # 合并候选相似度阈值（严格大于）
+CONSOLIDATE_MAX_PAIRS: int = 20         # 单次 /consolidate 最多处理的候选对（控 LLM 成本）
+CONSOLIDATE_SUGGEST_COUNT: int = 500    # 活跃 episodic+emotional 超此数时启动提示建议清理
+CONSOLIDATED_MAX_LENGTH: int = 120      # 融合记忆内容的最大字数
+
+
 # ── 启动检查 ──────────────────────────────────────────────
 
 def check_config() -> list[str]:
@@ -112,6 +163,13 @@ def check_config() -> list[str]:
             "  如果 embedding 与聊天使用同一个 provider，可不单独设置 EMBEDDING_API_KEY，"
             "但必须提供 DEEPSEEK_API_KEY。\n"
             "  如果使用独立 embedding provider，请设置 EMBEDDING_API_KEY。"
+        )
+
+    if not (0.0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1.0):
+        errors.append(
+            f"激活阈值分层非法：要求 0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1，"
+            f"当前 MID={SIMILARITY_MID}、HIGH={SIMILARITY_HIGH}。\n"
+            f"  MID >= HIGH 会使轻激活带 (MID, HIGH] 为空集，轻激活机制失效。"
         )
 
     return errors
