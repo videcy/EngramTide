@@ -43,11 +43,12 @@ DEEPSEEK_API_KEY: str | None = _get_env("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL: str = _get_env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # Chat 模型
-DEEPSEEK_CHAT_MODEL: str = _get_env("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
+DEEPSEEK_CHAT_MODEL: str = _get_env("DEEPSEEK_CHAT_MODEL", "deepseek-v4-flash")
 
-# Embedding provider（独立于聊天模型，默认沿用 DeepSeek key/base_url 以兼容旧配置）
-EMBEDDING_API_KEY: str | None = _get_env("EMBEDDING_API_KEY", DEEPSEEK_API_KEY)
-EMBEDDING_BASE_URL: str = _get_env("EMBEDDING_BASE_URL", DEEPSEEK_BASE_URL)
+# Embedding provider 独立配置。DeepSeek 聊天 API 不提供此项目所需的 embedding 接口，
+# 因此不再隐式复用聊天 key/base_url，避免首次请求才暴露配置错误。
+EMBEDDING_API_KEY: str | None = _get_env("EMBEDDING_API_KEY")
+EMBEDDING_BASE_URL: str = _get_env("EMBEDDING_BASE_URL", "") or ""
 EMBEDDING_MODEL: str = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
 
 
@@ -74,10 +75,16 @@ RETRIEVAL_MIN_DECAY: float = 0.1        # 低于此权重的记忆不参与检�
 # ── 浮现参数（Phase 2）──────────────────────────────────────
 
 SURFACE_AROUSAL_THRESHOLD: float = 0.7      # emotional 浮现的唤醒度阈值
-SURFACE_EMOTIONAL_MIN_DECAY: float = 0.3    # emotional 浮现的最低衰减权重
-SURFACE_UNRESOLVED_MIN_DECAY: float = 0.2   # unresolved 浮现的最低衰减权重
+SURFACE_EMOTIONAL_MIN_DECAY: float = float(
+    _get_env("SURFACE_EMOTIONAL_MIN_DECAY", "0.3") or "0.3"
+)  # emotional 浮现的最低衰减权重
+SURFACE_UNRESOLVED_MIN_DECAY: float = float(
+    _get_env("SURFACE_UNRESOLVED_MIN_DECAY", "0.2") or "0.2"
+)  # unresolved 浮现的最低衰减权重
 SURFACE_RECENT_DAYS: int = 3                # episodic "近期事件"窗口（天）
-SURFACE_EPISODIC_MIN_DECAY: float = 0.5     # 近期 episodic 浮现的最低衰减权重
+SURFACE_EPISODIC_MIN_DECAY: float = float(
+    _get_env("SURFACE_EPISODIC_MIN_DECAY", "0.5") or "0.5"
+)  # 近期 episodic 浮现的最低衰减权重
 MAX_SURFACED_MEMORIES: int = 8              # 浮现总数上限，防止上下文淹没
 
 # ── 写入管线参数（Phase 2）──────────────────────────────────
@@ -94,10 +101,14 @@ CONTEXT_AWARE_ENABLED: bool = (
     _get_env("CONTEXT_AWARE_ENABLED", "true").lower() != "false"
 )  # ★ 总开关：false 时逐轮激活完全关闭（消融/回退用）
 
-# 阈值经真实 embedding 校准定标（notebook §8，2026-07-07）：
-# 无关对 P95=0.588 < MID < 相关对 P25=0.851；MID 取间隙中点，HIGH 取相关对 P25。
-SIMILARITY_HIGH: float = 0.85           # 强激活相似度阈值（严格大于），由 0.7 校准为 0.85
-SIMILARITY_MID: float = 0.72            # 轻激活相似度阈值（严格大于），由 0.4 校准为 0.72
+# 默认阈值按 MiniLM 英文域内样本定标（experiment/calibration_report.json）：
+# P95_unrelated=0.099、P25_related=0.558；MID 取间隙中点，HIGH 取 related P25。
+SIMILARITY_HIGH: float = float(
+    _get_env("SIMILARITY_HIGH", "0.56") or "0.56"
+)  # MiniLM English cal: P25_related=0.56
+SIMILARITY_MID: float = float(
+    _get_env("SIMILARITY_MID", "0.33") or "0.33"
+)  # MiniLM English cal: (P95_unrel+P25_rel)/2=0.33
 ACTIVATION_HIGH: float = 0.2            # 强激活时 decay_weight 回升量
 ACTIVATION_MID: float = 0.05            # 轻激活时 decay_weight 回升量
 MAX_ACTIVATIONS_PER_TURN: int = 30      # ★ 单轮最多激活条数（按相似度降序保留）
@@ -140,6 +151,19 @@ CONSOLIDATE_SUGGEST_COUNT: int = 500    # 活跃 episodic+emotional 超此数时
 CONSOLIDATED_MAX_LENGTH: int = 120      # 融合记忆内容的最大字数
 
 
+# ── Phase 5 消融开关（环境变量可控）────────────────────────
+
+ABL_ACCESS_RETRIEVAL: bool = (
+    _get_env("ABL_ACCESS_RETRIEVAL", "on").lower() != "off"
+)                                       # ★ off 时检索入上下文不计访问
+ABL_ACCESS_ACTIVATION: bool = (
+    _get_env("ABL_ACCESS_ACTIVATION", "on").lower() != "off"
+)                                       # ★ off 时强激活不计访问
+ABL_ACCESS_SURFACE: bool = (
+    _get_env("ABL_ACCESS_SURFACE", "on").lower() != "off"
+)                                       # ★ off 时浮现不计访问
+
+
 # ── 启动检查 ──────────────────────────────────────────────
 
 def check_config() -> list[str]:
@@ -160,9 +184,13 @@ def check_config() -> list[str]:
     if not EMBEDDING_API_KEY:
         errors.append(
             "缺少 EMBEDDING_API_KEY 环境变量。\n"
-            "  如果 embedding 与聊天使用同一个 provider，可不单独设置 EMBEDDING_API_KEY，"
-            "但必须提供 DEEPSEEK_API_KEY。\n"
-            "  如果使用独立 embedding provider，请设置 EMBEDDING_API_KEY。"
+            "  请配置提供 OpenAI-compatible /v1/embeddings 接口的服务凭据。"
+        )
+
+    if not EMBEDDING_BASE_URL:
+        errors.append(
+            "缺少 EMBEDDING_BASE_URL 环境变量。\n"
+            "  请填写 embedding 服务的基础 URL（代码会追加 /v1/embeddings）。"
         )
 
     if not (0.0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1.0):
@@ -170,6 +198,18 @@ def check_config() -> list[str]:
             f"激活阈值分层非法：要求 0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1，"
             f"当前 MID={SIMILARITY_MID}、HIGH={SIMILARITY_HIGH}。\n"
             f"  MID >= HIGH 会使轻激活带 (MID, HIGH] 为空集，轻激活机制失效。"
+        )
+
+    # Phase 5 消融开关互斥检查（warning 而非 error——全部 off 本身就是 A4 正对照）
+    off_count = sum([
+        not ABL_ACCESS_RETRIEVAL,
+        not ABL_ACCESS_ACTIVATION,
+        not ABL_ACCESS_SURFACE,
+    ])
+    if off_count == 3:
+        errors.append(
+            "⚠ A4 正对照模式：全部消融开关关闭（ABL_ACCESS_*=off）。"
+            "此模式下 λ̂ 应 ≡ λ_theory。"
         )
 
     return errors

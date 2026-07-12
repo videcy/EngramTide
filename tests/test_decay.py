@@ -411,6 +411,21 @@ def _make_vec(values: list[float]) -> np.ndarray:
     return np.array(values, dtype=np.float32)
 
 
+def _vec_for_cosine(sim: float, dim: int = 2) -> np.ndarray:
+    """构造与第一坐标轴余弦相似度为 sim 的单位向量。"""
+    assert dim >= 2
+    values = [sim, math.sqrt(max(0.0, 1.0 - sim * sim))] + [0.0] * (dim - 2)
+    return _make_vec(values)
+
+
+def _mild_vec(position: float = 0.5, dim: int = 2) -> np.ndarray:
+    """按当前配置在轻激活带内构造向量，避免测试绑定历史阈值。"""
+    from config import SIMILARITY_HIGH, SIMILARITY_MID
+
+    sim = SIMILARITY_MID + position * (SIMILARITY_HIGH - SIMILARITY_MID)
+    return _vec_for_cosine(sim, dim=dim)
+
+
 class TestComputeActivations:
     """激活计算纯函数测试。"""
 
@@ -446,11 +461,11 @@ class TestComputeActivations:
 
     def test_mild_activation_between_thresholds(self):
         """SIMILARITY_MID < sim <= SIMILARITY_HIGH → 轻激活，权重 +0.05。"""
-        # 构造 sim = 0.8 的向量（落在轻激活带 (0.72, 0.85]）
+        # 根据当前域内校准阈值，在轻激活带内部构造向量。
         query = _make_vec([1.0, 0.0])
         mems = [
             _make_mem("emotional", "略相关", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6])),  # sim = 0.8
+                      embedding=_mild_vec()),
         ]
         from core.decay import compute_activations
         activations, report = compute_activations(query, mems)
@@ -502,7 +517,7 @@ class TestComputeActivations:
         query = _make_vec([1.0, 0.0])
         mems = [
             _make_mem("episodic", "触底", decay_weight=0.01,
-                      embedding=_make_vec([0.8, 0.6])),  # sim=0.8, mild
+                      embedding=_mild_vec()),
         ]
         from core.decay import compute_activations
         _, report = compute_activations(query, mems)
@@ -549,7 +564,7 @@ class TestComputeActivations:
             _make_mem("episodic", "强命中", decay_weight=0.3,
                       embedding=_make_vec([1.0, 0.0])),       # sim=1.0, strong
             _make_mem("episodic", "轻命中", decay_weight=0.4,
-                      embedding=_make_vec([0.8, 0.6])),       # sim=0.8, mild
+                      embedding=_mild_vec()),
         ]
         from core.decay import compute_activations
         activations, report = compute_activations(query, mems)
@@ -888,7 +903,7 @@ class TestMildOncePerSession:
         mid = str(uuid.uuid4())
         mems = [
             _make_mem("episodic", "轻激活记忆", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6])),  # sim=0.8, mild
+                      embedding=_mild_vec()),
         ]
         # 覆盖 memory_id
         mems[0].memory_id = mid
@@ -926,7 +941,7 @@ class TestMildOncePerSession:
         mid = str(uuid.uuid4())
         mems = [
             _make_mem("episodic", "轻激活", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6])),  # sim=0.8, mild
+                      embedding=_mild_vec()),
         ]
         mems[0].memory_id = mid
 
@@ -941,7 +956,7 @@ class TestMildOncePerSession:
         query = _make_vec([1.0, 0.0])
         mems = [
             _make_mem("episodic", "轻激活", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6])),
+                      embedding=_mild_vec()),
         ]
         exclude = frozenset([str(uuid.uuid4())])
         exclude_copy = set(exclude)
@@ -957,7 +972,7 @@ class TestMildOncePerSession:
         mid = str(uuid.uuid4())
         insert_memory(
             _make_mem("episodic", "轻激活目标", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6, 0.0]))  # sim=0.8, mild
+                      embedding=_mild_vec(dim=3))
         )
         # 覆盖 id
         mems = list_active_memories()
@@ -978,7 +993,7 @@ class TestMildOncePerSession:
         mid = str(uuid.uuid4())
         mems = [
             _make_mem("episodic", "跨轮轻激活", decay_weight=0.5,
-                      embedding=_make_vec([0.8, 0.6])),
+                      embedding=_mild_vec()),
         ]
         mems[0].memory_id = mid
 
@@ -1019,12 +1034,12 @@ class TestMildOncePerSession:
 
         query = _make_vec([1.0, 0.0])
         excluded_id = str(uuid.uuid4())
-        # 被排除的轻激活（sim=0.8，更高）+ 未排除的轻激活（sim≈0.73）
+        # 两条都在当前轻激活带内；被排除者相似度更高。
         excluded = _make_mem("被排除的轻激活", decay_weight=0.5,
-                             embedding=_make_vec([0.8, 0.6]))
+                             embedding=_mild_vec(position=0.75))
         excluded.memory_id = excluded_id
         other = _make_mem("正常轻激活", decay_weight=0.5,
-                          embedding=_make_vec([0.73, 0.6834]))
+                          embedding=_mild_vec(position=0.25))
         for m in [excluded, other]:
             m.type = "episodic"
 

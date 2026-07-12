@@ -21,6 +21,7 @@ from core.memory_store import (
     Memory,
     insert_memory,
     list_active_memories,
+    log_access_event,
     mark_accessed,
     mark_superseded,
     reinforce_memory,
@@ -185,6 +186,7 @@ def _handle_procedural(
         if sim >= PROCEDURAL_DEDUP_THRESHOLD:
             # 去重：只标记访问，不写入新记忆
             mark_accessed([old_mem.memory_id])
+            log_access_event(old_mem.memory_id, "dedup")
             report.deduped += 1
             return
 

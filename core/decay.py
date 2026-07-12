@@ -40,6 +40,27 @@ logger = logging.getLogger(__name__)
 # 不衰减的类型集合
 _STATIC_TYPES = {"semantic", "procedural"}
 
+# Phase 5 日志开关（环境变量可控）
+_ACCESS_LOG_ENABLED = (
+    __import__("os").getenv("ACCESS_LOG_ENABLED", "true").lower() != "false"
+)
+
+
+def _log_decay_event(
+    memory_id: str,
+    hours: float,
+    n: int,
+    multiplier: float,
+    floored: bool,
+) -> None:
+    """记录一次衰减事件到 decay_events 表。"""
+    from datetime import datetime, timezone
+
+    from core.memory_store import log_decay_event
+
+    ts = datetime.now(timezone.utc).isoformat()
+    log_decay_event(memory_id, ts, hours, n, multiplier, floored)
+
 
 # ── 数据结构 ──────────────────────────────────────────────
 
@@ -140,6 +161,15 @@ def apply_decay(
         if new_weight <= DECAY_FLOOR:
             new_weight = DECAY_FLOOR
             floored += 1
+
+        # Phase 5 日志：记录衰减事件
+        _log_decay_event(
+            mem.memory_id,
+            hours_elapsed,
+            mem.access_count,
+            multiplier,
+            new_weight <= DECAY_FLOOR,
+        )
 
         # 只记录实际变化的条目
         if abs(new_weight - mem.decay_weight) > 1e-12:
@@ -531,6 +561,13 @@ def context_aware_update(
 
     # 强激活计访问
     if report.strong_ids:
-        mark_accessed(report.strong_ids)
+        from config import ABL_ACCESS_ACTIVATION
+        if ABL_ACCESS_ACTIVATION:
+            mark_accessed(report.strong_ids)
+        if _ACCESS_LOG_ENABLED:
+            for mid in report.strong_ids:
+                from core.memory_store import log_access_event
+                source = "strong_activation" if ABL_ACCESS_ACTIVATION else "strong_activation_ablated"
+                log_access_event(mid, source)
 
     return report

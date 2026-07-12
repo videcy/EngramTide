@@ -443,10 +443,21 @@ class TestConfig:
         """有 API key 时无错误。"""
         monkeypatch.setattr("config.DEEPSEEK_API_KEY", "sk-test")
         monkeypatch.setattr("config.EMBEDDING_API_KEY", "sk-test")
+        monkeypatch.setattr("config.EMBEDDING_BASE_URL", "https://embedding.example.com")
         from config import check_config
 
         errors = check_config()
         assert len(errors) == 0
+
+    def test_check_config_requires_embedding_base_url(self, monkeypatch):
+        """Embedding key 与 base URL 都必须显式配置。"""
+        monkeypatch.setattr("config.DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr("config.EMBEDDING_API_KEY", "sk-test")
+        monkeypatch.setattr("config.EMBEDDING_BASE_URL", "")
+        from config import check_config
+
+        errors = check_config()
+        assert any("EMBEDDING_BASE_URL" in err for err in errors)
 
 
 # ════════════════════════════════════════════════════════════
@@ -618,12 +629,16 @@ class TestAccessCountThreeWayDedup:
             Memory(memory_id=star_id, type="episodic", content="三路计数",
                    decay_weight=0.5, embedding=v)
         )
-        # 对照：只走检索通道的轻激活带记忆（sim=0.6）
+        # 对照：按当前校准阈值构造轻激活带记忆。
+        from config import SIMILARITY_HIGH, SIMILARITY_MID
+        mild_sim = (SIMILARITY_MID + SIMILARITY_HIGH) / 2
         mild_id = str(uuid.uuid4())
         insert_memory(
             Memory(memory_id=mild_id, type="episodic", content="轻激活带",
                    decay_weight=1.0,
-                   embedding=np.array([0.6, 0.8, 0.0], dtype=np.float32))
+                   embedding=np.array(
+                       [mild_sim, np.sqrt(1.0 - mild_sim**2), 0.0], dtype=np.float32
+                   ))
         )
 
         # ① 会话开始：浮现记忆会话级计 1 次（main.py 会话初始化语义）
@@ -633,7 +648,7 @@ class TestAccessCountThreeWayDedup:
         # ② 本轮：逐轮激活（强激活在 context_aware_update 内部计 1 次）
         report = context_aware_update(v)
         assert star_id in report.strong_ids
-        assert mild_id not in report.strong_ids  # sim=0.6 → 只轻激活
+        assert mild_id not in report.strong_ids
 
         # ③ 检索进入上下文
         retrieved_ids = [m.memory_id for m, _ in retrieve_memories(v, top_k=5)]

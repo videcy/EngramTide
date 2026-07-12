@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 
 from config import (
+    ABL_ACCESS_RETRIEVAL,
+    ABL_ACCESS_SURFACE,
     CONSOLIDATE_SUGGEST_COUNT,
     CONTEXT_AWARE_ENABLED,
     MAX_CONTEXT_TOKENS,
@@ -30,6 +32,7 @@ from core.memory_store import (
     init_db,
     list_active_memories,
     list_recent_memories,
+    log_access_event,
     mark_accessed,
 )
 from core.decay import run_decay_update, get_surfaced_memories, context_aware_update
@@ -50,7 +53,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
 )
-logger = logging.getLogger("memory-engine")
+logger = logging.getLogger("EngramTide")
 
 # 控制 debug 输出的开关（运行时切换）
 _debug_enabled: bool = False
@@ -140,7 +143,12 @@ async def main_loop() -> None:
 
     # Phase 3 修复：浮现记忆每会话计 1 次访问
     if surfaced_ids:
-        mark_accessed(list(surfaced_ids))
+        if ABL_ACCESS_SURFACE:
+            mark_accessed(list(surfaced_ids))
+        # Phase 5 日志：消融时仍记录触发事件，但不增加 access_count。
+        source = "surface" if ABL_ACCESS_SURFACE else "surface_ablated"
+        for mid in surfaced_ids:
+            log_access_event(mid, source)
 
     if not CONTEXT_AWARE_ENABLED:
         logger.info("⚠ Context-Aware 激活已通过环境变量关闭（Phase 2 等价模式）")
@@ -352,11 +360,17 @@ async def main_loop() -> None:
                     "dropped": memory_context.dropped_count,
                 }
                 # Phase 3：三路去重 — 排除浮现（已计）和本轮强激活（context_aware_update 已计）
-                mark_accessed([
+                retrieval_access_ids = [
                     mid for mid in memory_context.included_memory_ids
                     if mid not in surfaced_ids
                     and mid not in activation_report.strong_ids
-                ])
+                ]
+                if ABL_ACCESS_RETRIEVAL:
+                    mark_accessed(retrieval_access_ids)
+                # Phase 5 日志（不计访问时仍记录事件，source 标记为 retrieval_ablated）
+                for mid in retrieval_access_ids:
+                    source = "retrieval" if ABL_ACCESS_RETRIEVAL else "retrieval_ablated"
+                    log_access_event(mid, source)
 
                 if _debug_enabled:
                     _debug("--- 动态行为修正案 ---")

@@ -8,8 +8,8 @@ Phase 1 MVP — Embedding API 客户端。
 - 请求失败时抛出带上下文的异常。
 
 支持通过环境变量切换 provider：
-  EMBEDDING_BASE_URL → 默认沿用 DEEPSEEK_BASE_URL
-  EMBEDDING_API_KEY  → 默认沿用 DEEPSEEK_API_KEY
+  EMBEDDING_BASE_URL → 必填，提供 OpenAI-compatible 接口的服务地址
+  EMBEDDING_API_KEY  → 必填，独立 embedding 服务凭据
   EMBEDDING_MODEL    → 默认 text-embedding-3-small
 """
 

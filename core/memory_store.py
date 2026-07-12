@@ -140,6 +140,30 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 """
 
 
+# ── Phase 5：日志表（纯增量埋点，不改生产 schema）──────────
+
+CREATE_DECAY_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS decay_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id   TEXT NOT NULL,
+    ts          TEXT NOT NULL,         -- ISO timestamp
+    hours       REAL NOT NULL,        -- Δt since last decay
+    n           INTEGER NOT NULL,     -- access_count at event time
+    multiplier  REAL NOT NULL,        -- exp(-rate · hours / (24·s))
+    floored     INTEGER NOT NULL      -- 1 if clamped to DECAY_FLOOR
+);
+"""
+
+CREATE_ACCESS_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS access_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id   TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    source      TEXT NOT NULL          -- retrieval / strong_activation / surface / dedup
+);
+"""
+
+
 # ── 连接管理 ──────────────────────────────────────────────
 
 _connection: sqlite3.Connection | None = None
@@ -170,7 +194,7 @@ def close_db() -> None:
 
 
 def init_db() -> None:
-    """初始化数据库：建表、建索引。幂等（Phase 2 新增 meta 表和 3 条索引）。"""
+    """初始化数据库：建表、建索引。幂等（Phase 2 新增 meta 表和 3 条索引，Phase 5 新增日志表）。"""
     conn = _get_conn()
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(CREATE_INDEX_SQL)
@@ -184,6 +208,9 @@ def init_db() -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memories_unresolved ON memories(unresolved);"
     )
+    # Phase 5 日志表
+    conn.execute(CREATE_DECAY_EVENTS_SQL)
+    conn.execute(CREATE_ACCESS_EVENTS_SQL)
     # Phase 2 meta 表
     conn.execute(
         "CREATE TABLE IF NOT EXISTS meta ("
@@ -367,3 +394,61 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         tags=tags,
         superseded_by=row["superseded_by"],
     )
+
+
+# ── Phase 5 日志函数（纯增量埋点）─────────────────────────
+
+
+def log_decay_event(
+    memory_id: str,
+    ts: str,
+    hours: float,
+    n: int,
+    multiplier: float,
+    floored: bool,
+) -> None:
+    """记录一次衰减事件。"""
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO decay_events (memory_id, ts, hours, n, multiplier, floored) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (memory_id, ts, hours, n, multiplier, int(floored)),
+    )
+    conn.commit()
+
+
+def log_access_event(
+    memory_id: str,
+    source: str,
+) -> None:
+    """记录一次计访问事件，带来源标签。source ∈ {retrieval, strong_activation, surface, dedup}。"""
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO access_events (memory_id, ts, source) VALUES (?, ?, ?)",
+        (memory_id, ts, source),
+    )
+    conn.commit()
+
+
+def query_decay_events(memory_id: str) -> list[dict]:
+    """查询某条记忆的全部衰减事件（供分析用）。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT ts, hours, n, multiplier, floored FROM decay_events "
+        "WHERE memory_id = ? ORDER BY ts",
+        (memory_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def query_access_events(memory_id: str) -> list[dict]:
+    """查询某条记忆的全部访问事件。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT ts, source FROM access_events WHERE memory_id = ? ORDER BY ts",
+        (memory_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

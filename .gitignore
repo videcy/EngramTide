@@ -6,15 +6,27 @@
 
 # Python 缓存
 __pycache__/
-*.pyc
+*.py[cod]
 
 # pytest 缓存
 .pytest_cache/
 pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
 
 # IDE
 .vscode/
 .idea/
 
-# 数据库文件（可选：如需保留种子数据则去掉下行）
+# SQLite 运行数据（保留 data/.gitkeep）
 data/*.db
+data/**/*.db
+data/*.db-wal
+data/*.db-shm
+data/**/*.db-wal
+data/**/*.db-shm
