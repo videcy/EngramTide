@@ -68,6 +68,127 @@ python main.py
 | `KEYWORD_CHANNEL_ENABLED` | true | 只使用向量相似度检索 |
 | `MILD_ONCE_PER_SESSION` | true | 轻激活不设会话内次数上限 |
 
+## 接入现有 Python Agent
+
+除自带 CLI 外，EngramTide 提供本地 Python API。调用方在仓库根目录运行，或将仓库根目录
+加入其 Python 环境后，即可导入：
+
+```python
+from engramtide import EngramTide
+```
+
+最小会话流程：
+
+```python
+from engramtide import EngramTide
+
+
+async def run_conversation(agent, user_inputs: list[str]) -> list[str]:
+    engine = EngramTide(db_path="data/memories.db")
+    session = engine.start_session()
+    responses = []
+
+    for user_input in user_inputs:
+        prepared = await session.prepare_turn(user_input)
+
+        # 四类记忆片段，可按宿主 Agent 的 prompt 格式自行组装。
+        sections = prepared.prompt_sections()
+        response = await agent.generate(
+            user_input=user_input,
+            memory_context=sections,
+        )
+
+        # 只有真正交给 Agent 使用的记忆才计访问；同一 turn 重试不会重复计数。
+        session.acknowledge_used(prepared.turn_id)
+        session.add_message("assistant", response)
+        responses.append(response)
+
+    # 整段对话结束后统一提取并写入新记忆。
+    await session.end()
+    engine.close()
+    return responses
+```
+
+主要接口：
+
+| 接口 | 作用 |
+| --- | --- |
+| `EngramTide.start_session()` | 执行衰减并收集本会话的自主浮现候选 |
+| `session.prepare_turn()` | 语义激活、检索并按 Token 预算生成四类记忆上下文 |
+| `session.acknowledge_used()` | 对宿主实际采用的检索/浮现记忆计访问，支持幂等重试 |
+| `session.add_message()` | 记录宿主 Agent 的回复，供会话结束时提取记忆 |
+| `session.end()` | 话题分割、脱水并执行类型感知写入 |
+| `list_memories()` / `get_memory()` | 查看当前记忆 |
+| `export_memories()` | 导出不含 embedding 的 JSON-compatible 数据 |
+| `delete_memories()` | 硬删除记忆及其访问/衰减日志 |
+
+Python API 当前采用单进程、单 SQLite 数据库模型；不要在同一进程中并行创建指向不同
+数据库的多个 `EngramTide` 实例。`prepare_turn()` 会记录用户消息，宿主生成回复后应调用
+`add_message("assistant", response)`。若宿主最终没有采用某些记忆，可以向
+`acknowledge_used(turn_id, memory_ids=[...])` 只传实际使用的 ID。
+
+## Streamable HTTP MCP Server
+
+EngramTide 可以作为本机或可信局域网中的单用户 MCP Server 运行：
+
+```powershell
+python -m engramtide.mcp
+```
+
+默认端点为：
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+在支持 Streamable HTTP 的 MCP 客户端中添加以下服务器配置即可：
+
+```json
+{
+  "mcpServers": {
+    "engramtide": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+不同客户端对 `type` 字段的名称可能略有区别，连接 URL 保持不变。也可以使用 MCP
+Inspector 连接该 URL 检查工具列表和调用结果。
+
+推荐的 Agent 调用顺序：
+
+1. 对话开始调用 `start_session`，保存返回的显式 `session_id`。
+2. 每轮生成回复前调用 `prepare_turn(session_id, user_input, turn_id)`，将返回的四类
+   `memory_context` 注入 Agent prompt。
+3. 回复生成成功后调用 `commit_turn(session_id, turn_id, assistant_message)`；该调用确认
+   实际使用的记忆并记录回复，重复提交同一 `turn_id` 不会重复计数或写入对话。
+4. 正常结束时调用 `end_session`，执行话题分割、脱水和记忆写入；放弃会话时可调用
+   `close_session`，后者不会提取新记忆。
+
+MCP Server 还提供 `list_memories`、`export_memories` 和 `delete_memories` 管理工具。
+`delete_memories` 是不可恢复的硬删除，宿主 Agent 应在调用前获得用户明确确认。
+
+可选环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ENGRAMTIDE_MCP_HOST` | `127.0.0.1` | 监听地址；可信局域网可改为 `0.0.0.0` |
+| `ENGRAMTIDE_MCP_PORT` | `8765` | 监听端口 |
+| `ENGRAMTIDE_MCP_PATH` | `/mcp` | Streamable HTTP 端点路径 |
+| `ENGRAMTIDE_MCP_ALLOWED_HOSTS` | 本机 Host | 非本机监听时必填，多个值用逗号分隔 |
+| `ENGRAMTIDE_MCP_ALLOWED_ORIGINS` | 本机 Origin | 浏览器客户端跨域访问时按需配置 |
+| `ENGRAMTIDE_DB_PATH` | 继承 `MEMORY_DB_PATH` | MCP 实例使用的 SQLite 文件 |
+| `ENGRAMTIDE_SESSION_TTL_SECONDS` | `86400` | 空闲会话过期时间 |
+| `ENGRAMTIDE_MAX_SESSIONS` | `32` | 同时保留的显式会话上限 |
+
+此版本不提供 OAuth 或 Token 鉴权。默认仅绑定回环地址；只有在网络内所有设备均可信、
+且有防火墙隔离时才应监听 `0.0.0.0`。此时必须将实际服务器地址（含端口）写入
+`ENGRAMTIDE_MCP_ALLOWED_HOSTS`；浏览器型客户端还需配置 Origin。服务始终启用官方 SDK
+的 DNS rebinding 防护。显式会话保存在 MCP Server 进程内，服务重启后应重新调用
+`start_session`；已写入 SQLite 的长期记忆不受影响。不要直接将该端口暴露到公网。
+
 ## 对话命令
 
 | 命令 | 说明 |
@@ -91,6 +212,10 @@ EngramTide/
 ├── requirements.txt
 ├── config.py              # 全部阈值、功能开关与服务配置
 ├── main.py                # CLI 主循环（衰减→浮现→逐轮激活→检索→上下文→写入）
+├── engramtide/
+│   ├── __init__.py        # 公共 API 导出
+│   ├── api.py             # EngramTide / EngramTideSession Facade
+│   └── mcp/               # Streamable HTTP MCP Server 与会话适配层
 ├── core/
 │   ├── memory_store.py    # SQLite 存储层（哑 CRUD + meta 表）
 │   ├── embedding.py       # Embedding API 客户端
@@ -110,7 +235,7 @@ EngramTide/
 │   ├── similarity.py      # 余弦相似度
 │   ├── time_utils.py      # UTC 时间工具（全项目禁用裸 datetime.now()）
 │   └── token_counter.py   # Token 保守估算器
-├── tests/                 # 单元 + 集成测试（277 项）
+├── tests/                 # 单元 + 集成测试（286 项）
 │   └── fixtures/          # 真实 API 校准样本对等归档（不进 CI）
 └── data/                  # SQLite 数据库存放目录
 ```
@@ -180,7 +305,7 @@ SIMILARITY_MID < sim ≤ SIMILARITY_HIGH       → weight = min(1.0, weight + 0.
 pytest -p asyncio -o asyncio_mode=auto
 ```
 
-当前 **277 项测试全部通过**，覆盖：衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、双通道打分、Token 预算截断、会话上限、合并候选与端到端、功能开关回退等价性和核心流程回归。
+当前 **286 项测试全部通过**，覆盖：衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、双通道打分、Token 预算截断、会话上限、合并候选与端到端、Python API 与 MCP 会话/幂等/工具发现契约、功能开关回退等价性和核心流程回归。
 
 ## 技术栈
 
@@ -190,6 +315,7 @@ pytest -p asyncio -o asyncio_mode=auto
 - **LLM：** DeepSeek（OpenAI-compatible 接口）
 - **Embedding：** 独立 OpenAI-compatible `/v1/embeddings` provider
 - **关键词匹配：** rapidfuzz（缺失时自动降级纯向量）
+- **Agent 协议：** MCP Streamable HTTP（官方 Python SDK）
 
 ## 开发过程中的后续研究备注
 

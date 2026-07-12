@@ -105,6 +105,16 @@ ORDER BY created_at DESC
 LIMIT ?;
 """
 
+SELECT_BY_ID_SQL = """
+SELECT
+    memory_id, type, content, valence, arousal,
+    created_at, last_accessed, access_count,
+    decay_weight, embedding, source_conv_id,
+    unresolved, tags, superseded_by
+FROM memories
+WHERE memory_id = ?;
+"""
+
 UPDATE_ACCESS_SQL = """
 UPDATE memories
 SET access_count = access_count + 1,
@@ -293,6 +303,37 @@ def list_recent_memories(limit: int = 10) -> list[Memory]:
     conn = _get_conn()
     rows = conn.execute(SELECT_RECENT_SQL, (limit,)).fetchall()
     return [_row_to_memory(r) for r in rows]
+
+
+def get_memory(memory_id: str) -> Memory | None:
+    """按 ID 查询单条记忆；包括已经被 supersede 的记录。"""
+    conn = _get_conn()
+    row = conn.execute(SELECT_BY_ID_SQL, (memory_id,)).fetchone()
+    return _row_to_memory(row) if row else None
+
+
+def delete_memories(memory_ids: list[str]) -> int:
+    """彻底删除记忆及其衰减/访问日志，返回实际删除的记忆数量。"""
+    unique_ids = list(dict.fromkeys(mid for mid in memory_ids if mid))
+    if not unique_ids:
+        return 0
+
+    conn = _get_conn()
+    placeholders = ",".join("?" for _ in unique_ids)
+    with conn:
+        conn.execute(
+            f"DELETE FROM decay_events WHERE memory_id IN ({placeholders})",
+            unique_ids,
+        )
+        conn.execute(
+            f"DELETE FROM access_events WHERE memory_id IN ({placeholders})",
+            unique_ids,
+        )
+        cursor = conn.execute(
+            f"DELETE FROM memories WHERE memory_id IN ({placeholders})",
+            unique_ids,
+        )
+    return cursor.rowcount
 
 
 def mark_accessed(memory_ids: list[str]) -> None:
