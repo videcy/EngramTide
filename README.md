@@ -1,9 +1,64 @@
+<div align="center">
+
 # EngramTide
 
-EngramTide 是一个面向 AI Agent 的长期记忆系统，实现四类记忆
-（semantic / episodic / emotional / procedural）的差异化管理。
+### 为 AI Agent 构建会遗忘、会浮现、也会被唤醒的长期记忆
 
-**核心闭环：** 对话 → 话题分割 + 脱水写入记忆（类型感知管线） → 衰减与浮现 → 逐轮 Context-Aware 激活 → 双通道检索 + 浮现合并 → Token 预算截断 → Constitutional AI 上下文 → 带记忆回复。
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-Streamable_HTTP-6C47FF)](https://modelcontextprotocol.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-22A699.svg)](LICENSE)
+
+类型感知写入 · 情境激活 · 双通道检索 · 自主浮现 · 可解释衰减
+
+[快速开始](#快速开始) · [Python API](#接入现有-python-agent) · [MCP Server](#streamable-http-mcp-server) · [核心架构](#核心架构)
+
+</div>
+
+---
+
+EngramTide 是一个面向 AI Agent 的本地长期记忆系统。它不会把所有历史对话一股脑塞回
+上下文，而是将信息整理为四类记忆，分别执行写入、衰减、激活、检索和合并策略。
+
+> **核心闭环**
+>
+> 对话 → 话题分割与脱水 → 类型感知写入 → 衰减与自主浮现 → 逐轮情境激活
+> → 向量/关键词双通道检索 → Token 预算截断 → 带记忆回复
+
+## 为什么选择 EngramTide？
+
+| 能力 | 解决的问题 |
+| --- | --- |
+| 四类记忆模型 | 事实、经历、情绪和操作习惯不再用同一套规则粗放管理 |
+| Context-Aware 激活 | 相关输入可以唤醒已经沉底、常规检索无法命中的记忆 |
+| 衰减与自主浮现 | 记忆具有时间动态，而不是只增不减的静态向量库 |
+| 双通道检索 | 语义相似度负责理解意图，关键词通道兜住人名和专有名词 |
+| Token 预算控制 | 按条裁剪上下文，并为 procedural 记忆保留最低优先保障 |
+| Python API + MCP | 既可嵌入 Python Agent，也可作为 Streamable HTTP 服务接入 |
+
+## 四类记忆
+
+| 类型 | 典型内容 | 生命周期 |
+| --- | --- | --- |
+| `semantic` | 用户事实、稳定知识 | 不衰减；新事实可覆盖旧事实 |
+| `episodic` | 发生过的事件与经历 | 随时间衰减；可被相关语境重新激活 |
+| `emotional` | 带有情绪效价与唤醒度的体验 | 高唤醒记忆衰减更慢；相似体验可强化 |
+| `procedural` | 偏好、规则、做事方式 | 不衰减；写入时去重 |
+
+## 目录
+
+- [Context-Aware 激活与衰减](#context-aware-激活与衰减)
+- [上下文、检索与记忆维护](#上下文检索与记忆维护)
+- [快速开始](#快速开始)
+- [接入现有 Python Agent](#接入现有-python-agent)
+- [Streamable HTTP MCP Server](#streamable-http-mcp-server)
+- [对话命令](#对话命令)
+- [项目结构](#项目结构)
+- [核心架构](#核心架构)
+- [衰减、激活与浮现规则](#衰减与激活公式)
+- [运行测试](#运行测试)
+- [技术栈](#技术栈)
+- [研究备注](#开发过程中的后续研究备注)
+- [许可证](#许可证)
 
 ## Context-Aware 激活与衰减
 
@@ -22,9 +77,12 @@ EngramTide 是一个面向 AI Agent 的长期记忆系统，实现四类记忆
 
 ## 快速开始
 
-### 1. 环境准备
+### 1. 获取项目并准备环境
 
 ```powershell
+git clone https://github.com/videcy/EngramTide.git
+cd EngramTide
+
 # 创建虚拟环境
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -32,6 +90,9 @@ python -m venv .venv
 # 安装依赖
 pip install -r requirements.txt
 ```
+
+> 需要 Python 3.10+，并准备一个 DeepSeek Chat API 和一个兼容
+> OpenAI `/v1/embeddings` 协议的 Embedding 服务。
 
 ### 2. 配置 API Key
 
@@ -209,6 +270,7 @@ MCP Server 还提供 `list_memories`、`export_memories` 和 `delete_memories` �
 ```
 EngramTide/
 ├── README.md
+├── LICENSE
 ├── requirements.txt
 ├── config.py              # 全部阈值、功能开关与服务配置
 ├── main.py                # CLI 主循环（衰减→浮现→逐轮激活→检索→上下文→写入）
@@ -242,28 +304,26 @@ EngramTide/
 
 ## 核心架构
 
-```
-会话启动
-  ├─ run_decay_update()       → 衰减引擎（纯数学，无 LLM）
-  ├─ get_surfaced_memories()  → 主动浮现（R1>R2>R3>R4 优先级）
-  └─ 库规模检查 → /consolidate 提示
-
-每轮对话
-  ├─ embed_text(user_input)
-  ├─ context_aware_update()   → 逐轮激活（强/轻/唤醒，轻激活受会话上限）
-  ├─ retrieve_memories_detailed() → 双通道检索（vec+kw，含分数分解）
-  ├─ build_constitutional_memory_context(retrieved, surfaced=...)
-  │     └─ 去重合并（浮现优先）→ 四类分组 → Token 预算按条截断
-  └─ generate_response()      → Constitutional AI 模板 → LLM
-
-会话退出
-  ├─ split_conversation()     → LLM 话题分割（失败整段回退）
-  ├─ _dehydrate_segment() × N → 逐段脱水（单段失败不牵连其余段）
-  └─ write_memories()         → 写入管线
-        ├─ semantic   → 覆盖检测 → mark_superseded
-        ├─ emotional  → 强化检测 → reinforce_memory（不 insert）
-        ├─ procedural → 去重检测 → mark_accessed（不 insert）
-        └─ episodic   → 直接 insert
+```mermaid
+flowchart TD
+    A["会话启动"] --> B["衰减更新（纯数学）"]
+    B --> C["收集自主浮现记忆"]
+    C --> D["接收用户输入"]
+    D --> E["生成 Embedding"]
+    E --> F["Context-Aware 激活"]
+    F --> G["向量 + 关键词双通道检索"]
+    G --> H["合并浮现与检索结果"]
+    H --> I["四类分组与 Token 预算裁剪"]
+    I --> J["注入 Agent 上下文并生成回复"]
+    J --> K{"会话结束？"}
+    K -- "否" --> D
+    K -- "是" --> L["按话题分割会话"]
+    L --> M["逐段脱水"]
+    M --> N{"类型感知写入"}
+    N --> O["semantic：覆盖检测"]
+    N --> P["emotional：强化检测"]
+    N --> Q["procedural：去重"]
+    N --> R["episodic：直接写入"]
 ```
 
 ## 衰减与激活公式
@@ -305,7 +365,10 @@ SIMILARITY_MID < sim ≤ SIMILARITY_HIGH       → weight = min(1.0, weight + 0.
 pytest -p asyncio -o asyncio_mode=auto
 ```
 
-当前 **286 项测试全部通过**，覆盖：衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、双通道打分、Token 预算截断、会话上限、合并候选与端到端、Python API 与 MCP 会话/幂等/工具发现契约、功能开关回退等价性和核心流程回归。
+测试套件共 **286 项**，覆盖衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、
+双通道打分、Token 预算截断、会话上限、合并候选与端到端、Python API 与 MCP
+会话/幂等/工具发现契约、功能开关回退等价性和核心流程回归。其中包含严格的毫秒级性能
+基准，结果会受到机器负载与硬件性能影响。
 
 ## 技术栈
 
@@ -336,3 +399,15 @@ pytest -p asyncio -o asyncio_mode=auto
 两个空间给出的通道份额排序发生变化，而作为固定参照的自主浮现事件数不会因为其他通道变强
 或变弱而被动改写。由此形成论文的核心结论：在阈值门控的 Agent 记忆系统中，仅用相对份额做
 通道归因并不稳健；应同时报告绝对事件数、embedding 模型、阈值与完整校准协议。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
+
+---
+
+<div align="center">
+
+如果 EngramTide 对你有帮助，欢迎提出 Issue、提交 Pull Request，或给项目一个 Star。
+
+</div>
