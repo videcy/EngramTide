@@ -24,6 +24,35 @@ EngramTide 是一个面向 AI Agent 的本地长期记忆系统。它不会把�
 > 对话 → 话题分割与脱水 → 类型感知写入 → 衰减与自主浮现 → 逐轮情境激活
 > → 向量/关键词双通道检索 → Token 预算截断 → 带记忆回复
 
+## 设计思想：让记忆具有时间和状态
+
+EngramTide 并不试图复刻人脑，而是从认知科学和 Agent 研究中提取可以落地的软件机制。
+对项目影响最大的五项工作，分别解释了记忆为何会遗忘、为何能被语境唤醒，以及“想起”
+本身为何会改变记忆：
+
+1. **Ebbinghaus（1885），*Über das Gedächtnis***
+   开启了对保持与遗忘的定量研究。EngramTide 据此将时间引入记忆状态，让 episodic
+   和 emotional 记忆逐渐衰减，而不是永久保持固定权重。
+
+2. **Collins & Loftus（1975），[A Spreading-Activation Theory of Semantic Processing](https://doi.org/10.1037/0033-295X.82.6.407)**
+   提出了语义加工中的扩散激活理论。EngramTide 将这一思想工程化为 embedding
+   空间中的 Context-Aware 激活，使当前输入能够强化相关记忆并唤醒沉底记忆。
+
+3. **Bjork & Bjork（1992），*A New Theory of Disuse and an Old Theory of Stimulus Fluctuation***
+   区分了记忆的存储强度与提取强度。这为 EngramTide 提供了重要直觉：暂时检索不到
+   并不等于记忆已经消失，低权重记忆仍可在合适语境中重新出现。
+
+4. **Roediger & Karpicke（2006），[Test-Enhanced Learning](https://doi.org/10.1111/j.1467-9280.2006.01693.x)**
+   说明提取行为本身可以改善长期保持。EngramTide 将它作为访问强化的认知类比：
+   真正被使用的记忆会累计访问，并在后续衰减中获得更强的保持能力。
+
+5. **Park et al.（2023），[Generative Agents](https://doi.org/10.1145/3586183.3606763)**
+   展示了由记忆流、检索和反思支撑的生成式 Agent。EngramTide 在此基础上进一步区分
+   “生成新的反思”与“重新浮现已有记忆”，让重要经历能够主动进入当前上下文。
+
+> 这些工作共同塑造了 EngramTide 的核心取向：记忆不是静态资料，而是会遗忘、会因使用
+> 而改变，也会被当下语境重新唤醒的动态状态。
+
 ## 为什么选择 EngramTide？
 
 | 能力 | 解决的问题 |
@@ -46,6 +75,7 @@ EngramTide 是一个面向 AI Agent 的本地长期记忆系统。它不会把�
 
 ## 目录
 
+- [设计思想](#设计思想让记忆具有时间和状态)
 - [Context-Aware 激活与衰减](#context-aware-激活与衰减)
 - [上下文、检索与记忆维护](#上下文检索与记忆维护)
 - [快速开始](#快速开始)
