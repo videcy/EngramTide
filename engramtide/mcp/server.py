@@ -160,6 +160,24 @@ async def delete_memories(memory_ids: list[str]) -> dict[str, int]:
     return await get_manager().delete_memories(memory_ids)
 
 
+@mcp.tool()
+async def memory_stats() -> dict[str, Any]:
+    """Memory-growth observability: counts by type, 30-day net growth, DB size."""
+    return await get_manager().memory_stats()
+
+
+@mcp.tool()
+async def search_archive(query_text: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Search cold-archived memories. Archiving is not deletion — they are still here."""
+    return await get_manager().search_archive(query_text, limit)
+
+
+@mcp.tool()
+async def run_maintenance() -> dict[str, Any]:
+    """Run archiving, superseded purge and event-log retention right now."""
+    return await get_manager().run_maintenance()
+
+
 def main() -> None:
     mcp.run(transport="streamable-http")
 

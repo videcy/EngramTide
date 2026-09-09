@@ -27,15 +27,19 @@ from config import (
     check_config,
     ensure_data_dir,
 )
+import config
 from core.memory_store import (
     close_db,
     init_db,
     list_active_memories,
     list_recent_memories,
-    log_access_event,
+    log_access_events_batch,
     mark_accessed,
+    memory_stats,
 )
 from core.decay import run_decay_update, get_surfaced_memories, context_aware_update
+from core.maintenance import run_maintenance, search_archive
+from core.vector_index import similarity_map
 from core.memory_writer import write_memories
 from core.embedding import embed_text
 from core.retriever import retrieve_memories_detailed
@@ -44,7 +48,11 @@ from core.context_builder import (
     build_constitutional_memory_context,
 )
 from core.chat import generate_response
-from core.consolidator import consolidate_memories, find_merge_candidates
+from core.consolidator import (
+    consolidate_memories,
+    find_merge_candidates,
+    maybe_auto_consolidate,
+)
 from core.dehydrator import dehydrate_conversation
 
 # ── 日志配置 ──────────────────────────────────────────────
@@ -84,6 +92,9 @@ WELCOME = r"""
   /debug activation   查看激活统计
   /debug retrieval    查看检索分数分解
   /debug context      查看 token 预算用量
+  /stats              查看记忆规模与净增长
+  /maintenance        立即执行归档与埋点清理
+  /archive <关键词>   翻查已归档的记忆
 """
 
 
@@ -100,6 +111,40 @@ def _print_recent_memories() -> None:
         print(f"  [{i}] [{m.type}] {m.content}")
         print(f"      标签: {tags_str}  |  访问: {m.access_count} 次")
     print()
+
+
+def _fmt_bytes(n: int) -> str:
+    """把字节数格式化成人读的大小。"""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _print_stats() -> None:
+    """打印记忆规模与增长趋势。净增长率是判断治理是否生效的唯一指标。"""
+    st = memory_stats()
+    by_type = st["active_by_type"]
+    type_str = " / ".join(
+        f"{t} {by_type.get(t, 0)}"
+        for t in ("semantic", "episodic", "emotional", "procedural")
+    )
+    print(f"\n活跃记忆    {st['active_total']:>6,}  ({type_str})")
+    print(f"已归档      {st['archived']:>6,}")
+    print(f"已 supersede{st['superseded']:>6,}")
+    print(
+        f"近 30 天     新增 {st['new_last_30d']:,} / 归档 {st['archived_last_30d']:,}"
+        f"  → 净增长 {st['net_growth_last_30d']:+,}"
+    )
+    print(
+        f"埋点事件    decay {st['decay_events']:,} / access {st['access_events']:,}"
+    )
+    print(
+        f"DB 体积     {_fmt_bytes(st['db_bytes'])}"
+        f"   FTS5 索引: {'启用' if st['fts_enabled'] else '未启用'}\n"
+    )
 
 
 # ── 主循环 ────────────────────────────────────────────────
@@ -138,23 +183,33 @@ async def main_loop() -> None:
         decay_report.skipped,
         decay_report.floored,
     )
-    surfaced_memories = get_surfaced_memories(list_active_memories())
+    # P0+P4：衰减之后按频率跑一次维护（埋点保留期清理 + supersede 硬删 + 冷归档）
+    maintenance_report = run_maintenance()
+    if maintenance_report.ran and (
+        maintenance_report.archived or maintenance_report.purged
+    ):
+        print(
+            f"🧹 记忆库维护: 归档 {maintenance_report.archived} 条, "
+            f"清理已取代 {maintenance_report.purged} 条。"
+        )
+
+    all_mems = list_active_memories()
+    surfaced_memories = get_surfaced_memories(all_mems)
     surfaced_ids = {sm.memory_id for sm in surfaced_memories}
 
     # Phase 3 修复：浮现记忆每会话计 1 次访问
     if surfaced_ids:
         if ABL_ACCESS_SURFACE:
             mark_accessed(list(surfaced_ids))
-        # Phase 5 日志：消融时仍记录触发事件，但不增加 access_count。
-        source = "surface" if ABL_ACCESS_SURFACE else "surface_ablated"
-        for mid in surfaced_ids:
-            log_access_event(mid, source)
+        # Phase 5 埋点：消融时仍记录触发事件，但不增加 access_count。
+        if config.ACCESS_LOG_ENABLED:
+            source = "surface" if ABL_ACCESS_SURFACE else "surface_ablated"
+            log_access_events_batch([(mid, source) for mid in surfaced_ids])
 
     if not CONTEXT_AWARE_ENABLED:
         logger.info("⚠ Context-Aware 激活已通过环境变量关闭（Phase 2 等价模式）")
 
-    # Phase 4：启动时检查记忆库规模
-    all_mems = list_active_memories()
+    # Phase 4：启动时检查记忆库规模（复用上面已加载的列表，不再多查一次）
     epi_emo_count = sum(1 for m in all_mems if m.type in ("episodic", "emotional"))
     if epi_emo_count > CONSOLIDATE_SUGGEST_COUNT:
         print(f"💡 活跃 episodic/emotional 记忆已达 {epi_emo_count} 条，"
@@ -261,6 +316,30 @@ async def main_loop() -> None:
                     print("（本会话尚无上下文构建记录）")
                 continue
 
+            if user_input == "/stats":
+                _print_stats()
+                continue
+
+            if user_input == "/maintenance":
+                print("  ⏳ 正在执行维护...", end="\r")
+                rep = run_maintenance(force=True)
+                print(
+                    f"🧹 维护完成: 归档 {rep.archived} 条, "
+                    f"清理已取代 {rep.purged} 条, 清理埋点 {rep.pruned_events} 行。"
+                )
+                continue
+
+            if user_input.startswith("/archive "):
+                keyword = user_input[len("/archive "):].strip()
+                hits = search_archive(keyword)
+                if not hits:
+                    print("（归档中没有匹配的记忆）")
+                else:
+                    print(f"--- 归档命中（共 {len(hits)} 条）---")
+                    for i, m in enumerate(hits, 1):
+                        print(f"  [{i}] [{m.type}] {m.content}")
+                continue
+
             if user_input == "/consolidate preview":
                 all_mems = list_active_memories()
                 pairs = find_merge_candidates(all_mems)
@@ -298,11 +377,21 @@ async def main_loop() -> None:
                 query_embedding = await embed_text(user_input)
                 _debug(f"Query embedding 维度: {query_embedding.shape[0]}")
 
+                # P1：整轮只加载一次记忆、只算一次相似度矩阵，激活与检索共用。
+                # 原来两个函数各自 list_active_memories() + 各跑一遍 Python 逐条余弦，
+                # 等于每轮 2 次全表反序列化 + 2N 次函数调用。
+                turn_memories = list_active_memories()
+                turn_sims = similarity_map(query_embedding, turn_memories)
+
                 # Step A.5 Phase 3+4：Context-Aware 逐轮激活（含轻激活会话上限）
+                # context_aware_update 会把新权重同步写回 turn_memories 里的对象，
+                # 所以下面的检索读到的是激活后的权重，与改造前「落库→重读」等价。
                 activation_report = context_aware_update(
                     query_embedding,
+                    memories=turn_memories,
                     exclude_mild_ids=frozenset(session_mild_ids)
                         if MILD_ONCE_PER_SESSION else frozenset(),
+                    sims=turn_sims,
                 )
                 # 记录本轮轻激活 id 到会话集合
                 if MILD_ONCE_PER_SESSION and activation_report.mild_ids:
@@ -327,8 +416,10 @@ async def main_loop() -> None:
                 # Step B: 检索 Top-K 记忆（detailed 版，供分数分解）
                 retrieval_details = retrieve_memories_detailed(
                     query_embedding,
+                    memories=turn_memories,
                     top_k=TOP_K_RETRIEVE,
                     query_text=user_input,
+                    sims=turn_sims,
                 )
                 retrieved = [(d.memory, d.score) for d in retrieval_details]
 
@@ -367,10 +458,12 @@ async def main_loop() -> None:
                 ]
                 if ABL_ACCESS_RETRIEVAL:
                     mark_accessed(retrieval_access_ids)
-                # Phase 5 日志（不计访问时仍记录事件，source 标记为 retrieval_ablated）
-                for mid in retrieval_access_ids:
+                # Phase 5 埋点（默认关闭；不计访问时仍记录事件，source 标 _ablated）
+                if config.ACCESS_LOG_ENABLED and retrieval_access_ids:
                     source = "retrieval" if ABL_ACCESS_RETRIEVAL else "retrieval_ablated"
-                    log_access_event(mid, source)
+                    log_access_events_batch(
+                        [(mid, source) for mid in retrieval_access_ids]
+                    )
 
                 if _debug_enabled:
                     _debug("--- 动态行为修正案 ---")
@@ -459,6 +552,14 @@ async def _handle_exit(
                 write_report.failed,
             )
             print(f"✅ 写入完成（{detail}）。")
+
+            # P4-③：规模越线时自动合并近重复（默认关闭，见 CONSOLIDATE_AUTO_ENABLED）
+            auto_report = await maybe_auto_consolidate()
+            if auto_report is not None:
+                print(
+                    f"🔗 自动合并: 候选 {auto_report.candidates} 对, "
+                    f"融合 {auto_report.merged} 条。"
+                )
         else:
             print("（未生成新记忆）")
     except Exception as e:

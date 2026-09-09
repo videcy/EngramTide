@@ -27,8 +27,10 @@ from core.decay import get_surfaced_memories, run_decay_update
 from core.dehydrator import SplitReport, dehydrate_conversation
 from core.embedding import embed_text
 from core.memory_store import Memory
+from core.maintenance import MaintenanceReport, run_maintenance, search_archive
 from core.memory_writer import WriteReport, write_memories
 from core.retriever import RetrievalDetail, retrieve_memories_detailed
+from core.vector_index import reset_cache, similarity_map
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,8 @@ class EngramTide:
             if Path(memory_store.DB_PATH).resolve() != target:
                 memory_store.close_db()
                 memory_store.DB_PATH = target
+                # 换库必须丢掉进程内的向量矩阵，否则会拿旧库的记忆去打分
+                reset_cache()
 
         memory_store.init_db()
         self.db_path = Path(memory_store.DB_PATH).resolve()
@@ -174,15 +178,40 @@ class EngramTide:
         *,
         now: datetime | None = None,
     ) -> "EngramTideSession":
-        """Run session-start decay and collect (but do not count) surfaced memories."""
+        """Run session-start decay and collect (but do not count) surfaced memories.
+
+        Also runs frequency-gated maintenance (event-log retention, superseded
+        purge, cold archiving) so a long-lived host process still gets an exit
+        path for memory growth.
+        """
         decay_report = run_decay_update(now=now)
+        maintenance_report = run_maintenance(now=now)
         surfaced = get_surfaced_memories(memory_store.list_active_memories(), now=now)
         return EngramTideSession(
             engine=self,
             session_id=session_id or str(uuid.uuid4()),
             decay_report=decay_report,
             surfaced_memories=surfaced,
+            maintenance_report=maintenance_report,
         )
+
+    def stats(self) -> dict[str, Any]:
+        """Memory-growth observability: counts, 30-day net growth, DB size."""
+        return memory_store.memory_stats()
+
+    def search_archive(self, query_text: str, limit: int = 10) -> list[MemoryRecord]:
+        """Search cold-archived memories. Archiving is not deletion."""
+        return [
+            MemoryRecord.from_memory(m) for m in search_archive(query_text, limit)
+        ]
+
+    def restore_archived(self, memory_ids: Iterable[str]) -> int:
+        """Move archived memories back into the hot table."""
+        return memory_store.restore_archived(list(memory_ids))
+
+    def run_maintenance(self, *, force: bool = True) -> MaintenanceReport:
+        """Run archiving / retention maintenance on demand."""
+        return run_maintenance(force=force)
 
     def list_memories(self, *, limit: int | None = None) -> list[MemoryRecord]:
         memories = memory_store.list_active_memories()
@@ -224,10 +253,12 @@ class EngramTideSession:
         session_id: str,
         decay_report: DecayReport,
         surfaced_memories: Sequence[Memory],
+        maintenance_report: MaintenanceReport | None = None,
     ) -> None:
         self.engine = engine
         self.session_id = session_id
         self.decay_report = decay_report
+        self.maintenance_report = maintenance_report or MaintenanceReport()
         self.surfaced_memories = tuple(surfaced_memories)
         self._surfaced_ids = {memory.memory_id for memory in surfaced_memories}
         self._surface_acknowledged_ids: set[str] = set()
@@ -277,21 +308,33 @@ class EngramTideSession:
             raise ValueError(f"turn_id already prepared: {resolved_turn_id}")
 
         query_embedding = await embed_text(text)
+
+        # One load + one similarity matmul per turn, shared by activation and
+        # retrieval.  context_aware_update() writes the new decay weights back
+        # into these Memory objects, so retrieval below scores against the
+        # post-activation weights exactly as it did when it re-read the DB.
+        turn_memories = memory_store.list_active_memories()
+        turn_sims = similarity_map(query_embedding, turn_memories)
+
         activation_report = context_aware_update(
             query_embedding,
+            memories=turn_memories,
             exclude_mild_ids=(
                 frozenset(self._mild_ids)
                 if config.MILD_ONCE_PER_SESSION
                 else frozenset()
             ),
+            sims=turn_sims,
         )
         if config.MILD_ONCE_PER_SESSION:
             self._mild_ids.update(activation_report.mild_ids)
 
         details = retrieve_memories_detailed(
             query_embedding,
+            memories=turn_memories,
             top_k=top_k,
             query_text=text,
+            sims=turn_sims,
         )
         retrieved = [(detail.memory, detail.score) for detail in details]
         context = build_constitutional_memory_context(
@@ -385,9 +428,11 @@ class EngramTideSession:
         ordered = sorted(memory_ids)
         if enabled:
             memory_store.mark_accessed(ordered)
-        logged_source = source if enabled else f"{source}_ablated"
-        for memory_id in ordered:
-            memory_store.log_access_event(memory_id, logged_source)
+        if config.ACCESS_LOG_ENABLED:
+            logged_source = source if enabled else f"{source}_ablated"
+            memory_store.log_access_events_batch(
+                [(memory_id, logged_source) for memory_id in ordered]
+            )
 
     def _ensure_open(self) -> None:
         if self._closed:

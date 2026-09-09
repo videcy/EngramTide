@@ -5,15 +5,21 @@ Phase 2 — 类型感知写入管线。
   semantic   → 覆盖检测：insert 新记忆，再把高相似旧 semantic 标记 superseded_by
   emotional  → 强化检测：命中则更新旧记忆（不 insert），未命中则 insert
   procedural → 去重检测：近重复则只 mark_accessed 旧记忆（不 insert），否则 insert
-  episodic   → 直接 insert（不可覆盖，只能衰减沉底）
+  episodic   → 近重复检测：命中则强化已有记忆（不 insert），否则 insert
+
+P4-①：episodic 原先是四类里唯一无条件 insert 的类型——而它恰恰数量最大、衰减最快，
+是记忆库「只增不减」的主要来源。补上门槛后，写入速率不再是纯增量。
 """
 
 import logging
 from dataclasses import dataclass
 
+import config
 from config import (
     EMOTIONAL_REINFORCE_BOOST,
     EMOTIONAL_REINFORCE_THRESHOLD,
+    EPISODIC_DEDUP_THRESHOLD,
+    EPISODIC_REINFORCE_BOOST,
     PROCEDURAL_DEDUP_THRESHOLD,
     SEMANTIC_OVERRIDE_THRESHOLD,
 )
@@ -88,8 +94,10 @@ async def write_memories(new_memories: list[Memory]) -> WriteReport:
                 _handle_emotional(new_mem, existing_by_type.get("emotional", []), report)
             elif new_mem.type == "procedural":
                 _handle_procedural(new_mem, existing_by_type.get("procedural", []), report)
+            elif new_mem.type == "episodic":
+                _handle_episodic(new_mem, existing_by_type.get("episodic", []), report)
             else:
-                # episodic 或未知类型 → 直接插入
+                # 未知类型 → 直接插入（fail-safe：宁可多存，不丢数据）
                 insert_memory(new_mem)
                 report.inserted += 1
         except Exception as e:
@@ -186,10 +194,53 @@ def _handle_procedural(
         if sim >= PROCEDURAL_DEDUP_THRESHOLD:
             # 去重：只标记访问，不写入新记忆
             mark_accessed([old_mem.memory_id])
-            log_access_event(old_mem.memory_id, "dedup")
+            if config.ACCESS_LOG_ENABLED:
+                log_access_event(old_mem.memory_id, "dedup")
             report.deduped += 1
             return
 
     # 未命中 → insert
+    insert_memory(new_mem)
+    report.inserted += 1
+
+
+def _handle_episodic(
+    new_mem: Memory,
+    existing_episodic: list[Memory],
+    report: WriteReport,
+) -> None:
+    """
+    episodic 近重复检测（P4-①）：
+
+    1. 找出最相似的一条已有 episodic。
+    2. 相似度 >= EPISODIC_DEDUP_THRESHOLD → 强化它（提权重 + 合并标签 + 计访问），不新增。
+    3. 否则 insert。
+
+    ★ 语义权衡：episodic 是情景记忆，理论上两次相似但不同时刻的事件应当各自成条。
+      所以这里复用的是 emotional 的**强化**思路而不是 semantic 的**覆盖**思路，
+      且阈值定得比 semantic 的 0.85 更高（默认 0.88）——只拦截「同一件事被反复
+      脱水出来」的真重复。拦多了就调高阈值，或直接 EPISODIC_DEDUP_ENABLED=false。
+    """
+    if not config.EPISODIC_DEDUP_ENABLED or new_mem.embedding is None:
+        insert_memory(new_mem)
+        report.inserted += 1
+        return
+
+    best: Memory | None = None
+    best_sim = 0.0
+    for old_mem in existing_episodic:
+        if old_mem.superseded_by is not None:
+            continue
+        sim = _compute_similarity(new_mem.embedding, old_mem.embedding)
+        if sim > best_sim:
+            best, best_sim = old_mem, sim
+
+    if best is not None and best_sim >= EPISODIC_DEDUP_THRESHOLD:
+        new_weight = min(1.0, best.decay_weight + EPISODIC_REINFORCE_BOOST)
+        merged_tags = list(set(best.tags + new_mem.tags))
+        reinforce_memory(best.memory_id, new_weight, best.arousal, merged_tags)
+        report.reinforced += 1
+        return
+
     insert_memory(new_mem)
     report.inserted += 1
