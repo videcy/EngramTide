@@ -100,7 +100,8 @@ EngramTide 并不试图复刻人脑，而是从认知科学和 Agent 研究中�
 ## 上下文、检索与记忆维护
 
 - **话题分割**：退出脱水前先调 LLM 按话题切分会话，每段独立脱水（embedding 语义更纯）；索引校验失败/LLM 失败整段回退，单段失败不牵连其余段（记忆零丢失）。
-- **双通道检索**：`(0.7·向量 + 0.3·rapidfuzz 关键词) × decay_weight`，关键词通道兜住专有名词；`KEYWORD_CHANNEL_ENABLED=false` 或 rapidfuzz 缺失时降级为纯向量检索。
+- **双通道检索**：`(0.7·向量 + 0.3·关键词) × decay_weight`，关键词通道兜住专有名词。向量通道是一次归一化矩阵乘（激活与检索共用同一份相似度）；关键词通道走 SQLite 内置 FTS5 倒排索引（`trigram` 分词，对中文有效），bm25 分在候选集内 min-max 归一化到 [0, 1]。FTS5 不可用或查询项不足 3 字符时降级 rapidfuzz，再不可用则退化纯向量。
+- **记忆增长治理**：冷归档给「只增不减」的记忆库补上出口——沉底（`decay_weight` 触底）+ 从未被检索过（`access_count == 0`）+ 超过 `ARCHIVE_IDLE_DAYS` 无访问的 episodic 移入 `memories_archive`。**归档不是删除**：数据与向量都还在，`/archive <关键词>` 随时能翻出来，休眠唤醒机制不受影响。被真正用过的记忆永远不会被归档。
 - **Token 预算**：`MAX_CONTEXT_TOKENS=1500` 替代字符数近似——DeepSeek 系数保守估算器（宁高勿低），按条截断、procedural 保底、被丢弃记忆不计访问。
 - **轻激活会话上限**：`MILD_ONCE_PER_SESSION`——同一会话内同一记忆至多轻激活 1 次（强激活不设限），抑制发生在截断之前不占槽位。
 - **记忆合并**：`/consolidate` 手动触发——同类型、相似度 > 0.92 的近重复对由 LLM 融合为一条，旧记忆 `superseded_by` 指向新记忆；`preview` 模式零成本预览。
@@ -158,6 +159,12 @@ python main.py
 | `TOPIC_SPLIT_ENABLED` | true | 不分割话题，整段会话直接脱水 |
 | `KEYWORD_CHANNEL_ENABLED` | true | 只使用向量相似度检索 |
 | `MILD_ONCE_PER_SESSION` | true | 轻激活不设会话内次数上限 |
+| `FTS_ENABLED` | true | 关键词通道回落到 rapidfuzz 全表模糊匹配 |
+| `ARCHIVE_ENABLED` | true | 不做冷归档（记忆库恢复为只增不减） |
+| `EPISODIC_DEDUP_ENABLED` | true | episodic 恢复无条件直写，不做近重复强化 |
+| `DECAY_LOG_ENABLED` | **false** | 打开后记录每条记忆每次衰减（论文埋点，会显著增大 DB） |
+| `ACCESS_LOG_ENABLED` | **false** | 打开后记录每次计访问事件（同上） |
+| `CONSOLIDATE_AUTO_ENABLED` | **false** | 打开后退出时自动合并近重复（会发起 LLM 调用） |
 
 ## 接入现有 Python Agent
 
@@ -294,6 +301,9 @@ MCP Server 还提供 `list_memories`、`export_memories` 和 `delete_memories` �
 | `/debug activation` | 查看本会话激活统计（强/轻/唤醒/抑制）与最近一轮明细 |
 | `/debug retrieval` | 最近一轮 Top-K 分数分解 `[vec=\|kw=\|w=\|→]` |
 | `/debug context` | Token 预算用量（估算/预算/收录/丢弃） |
+| `/stats` | 记忆规模、按类型分布、近 30 天净增长、DB 体积 |
+| `/maintenance` | 立即执行冷归档 + supersede 清理 + 埋点保留期清理 |
+| `/archive <关键词>` | 翻查已归档的记忆（归档不是删除） |
 
 ## 项目结构
 
@@ -309,7 +319,9 @@ EngramTide/
 │   ├── api.py             # EngramTide / EngramTideSession Facade
 │   └── mcp/               # Streamable HTTP MCP Server 与会话适配层
 ├── core/
-│   ├── memory_store.py    # SQLite 存储层（哑 CRUD + meta 表）
+│   ├── memory_store.py    # SQLite 存储层（CRUD + meta + FTS5 + 归档表）
+│   ├── vector_index.py    # 进程内归一化向量矩阵缓存（一次矩阵乘算全量相似度）
+│   ├── maintenance.py     # 冷归档 / supersede 清理 / 埋点保留期
 │   ├── embedding.py       # Embedding API 客户端
 │   ├── dehydrator.py      # 话题分割 + 分段脱水
 │   ├── retriever.py       # 向量 + 关键词双通道检索
@@ -327,7 +339,10 @@ EngramTide/
 │   ├── similarity.py      # 余弦相似度
 │   ├── time_utils.py      # UTC 时间工具（全项目禁用裸 datetime.now()）
 │   └── token_counter.py   # Token 保守估算器
-├── tests/                 # 单元 + 集成测试（286 项）
+├── scripts/
+│   ├── rebuild_embeddings.py    # 改维度/换模型后的全库 embedding 重建
+│   └── calibrate_thresholds.py  # SIMILARITY_MID / HIGH 重标定（P95/P25 协议）
+├── tests/                 # 单元 + 集成测试（341 项）
 │   └── fixtures/          # 真实 API 校准样本对等归档（不进 CI）
 └── data/                  # SQLite 数据库存放目录
 ```
@@ -404,10 +419,11 @@ pytest -p asyncio -o asyncio_mode=auto
 
 - **语言：** Python 3.10+
 - **数据库：** SQLite（含 WAL 模式）
-- **向量存储：** numpy float32 BLOB 存入 SQLite
+- **向量存储：** numpy float32 BLOB 存入 SQLite（入库即 L2 归一化，默认 512 维）
+- **向量检索：** numpy 归一化矩阵乘暴力检索。**刻意不上 faiss / HNSW**——活跃记忆 2 万条以内，暴力矩阵乘比 ANN 更快，且不需要额外索引内存、持久化与增删同步；越过 `ANN_BACKEND_THRESHOLD` 会提示改用 `sqlite-vec`
 - **LLM：** DeepSeek（OpenAI-compatible 接口）
 - **Embedding：** 独立 OpenAI-compatible `/v1/embeddings` provider
-- **关键词匹配：** rapidfuzz（缺失时自动降级纯向量）
+- **关键词索引：** SQLite 内置 FTS5（`trigram` 分词，零新依赖）；rapidfuzz 作二级降级
 - **Agent 协议：** MCP Streamable HTTP（官方 Python SDK）
 
 ## 开发过程中的后续研究备注

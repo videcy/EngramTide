@@ -96,19 +96,11 @@ def find_merge_candidates_capped(
             continue
         candidates.append(mem)
 
-    # 计算所有同类型对
-    pairs: list[tuple[Memory, Memory, float]] = []
-    for i in range(len(candidates)):
-        for j in range(i + 1, len(candidates)):
-            a = candidates[i]
-            b = candidates[j]
-            if a.type != b.type:
-                continue
-            sim = cosine_similarity(a.embedding, b.embedding)
-            if sim > threshold:
-                pairs.append((a, b, sim))
+    # 计算所有同类型对（分块矩阵乘，见 _pairs_above_threshold）
+    pairs = _pairs_above_threshold(candidates, threshold)
 
-    # 按相似度降序
+    # 按相似度降序。_pairs_above_threshold 的产出顺序与原先的 (i, j) 双层循环一致，
+    # 配合 Python 的稳定排序，同分对的相对顺序与改造前相同。
     pairs.sort(key=lambda x: x[2], reverse=True)
 
     # 贪心配对（截断对同样占用 id，精确模拟无上限时的贪心，避免 capped 重复计数）
@@ -126,6 +118,84 @@ def find_merge_candidates_capped(
         result.append((a, b, sim))
 
     return (result, capped)
+
+
+def _pairs_above_threshold(
+    candidates: list[Memory],
+    threshold: float,
+) -> list[tuple[Memory, Memory, float]]:
+    """
+    在同类型记忆内找出 cosine > threshold 的所有对。
+
+    两两比较本身是 O(N²)，改不掉——但可以把 N² 次 Python 层 cosine_similarity
+    换成若干次 BLAS 矩阵乘。这是自动化合并的性能前提：N=10000 时朴素写法要跑
+    5×10⁷ 次 Python 函数调用。
+
+    分块的理由：M @ M.T 在 N=10000 时是 10⁸ 个 float32 = 400 MB。这里每次只算
+    CONSOLIDATE_BLOCK_SIZE 行 × 全量，峰值内存被压到 block × N。
+
+    只在同类型内比较（episodic 与 emotional 各自成组），这本来就是既有逻辑，
+    顺带把矩阵规模又降了一档。
+    """
+    from config import CONSOLIDATE_BLOCK_SIZE
+
+    by_type: dict[str, list[Memory]] = {}
+    for mem in candidates:
+        by_type.setdefault(mem.type, []).append(mem)
+
+    pairs: list[tuple[Memory, Memory, float]] = []
+    block = max(1, CONSOLIDATE_BLOCK_SIZE)
+
+    for group in by_type.values():
+        n = len(group)
+        if n < 2:
+            continue
+
+        dims = {m.embedding.shape[0] for m in group}
+        if len(dims) > 1:
+            # 混维无法成矩阵；退回逐条比较并跳过维度不符的对（正经修法是重建全库）
+            logger.warning(
+                "合并候选中存在 %d 种 embedding 维度 %s，本次退回逐条比较。",
+                len(dims), sorted(dims),
+            )
+            pairs.extend(_pairs_pairwise(group, threshold))
+            continue
+
+        matrix = np.vstack([m.embedding for m in group]).astype(np.float32, copy=False)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        np.maximum(norms, 1e-12, out=norms)
+        matrix = matrix / norms
+
+        for start in range(0, n, block):
+            stop = min(start + block, n)
+            sims = np.clip(matrix[start:stop] @ matrix.T, -1.0, 1.0)
+            # 只取严格上三角，避免自比与重复计对
+            rows, cols = np.nonzero(sims > threshold)
+            for r, c in zip(rows, cols):
+                i = start + int(r)
+                j = int(c)
+                if j <= i:
+                    continue
+                pairs.append((group[i], group[j], float(sims[r, j])))
+
+    return pairs
+
+
+def _pairs_pairwise(
+    group: list[Memory],
+    threshold: float,
+) -> list[tuple[Memory, Memory, float]]:
+    """混维时的逐条兜底路径。维度不符的对按不相似处理。"""
+    out: list[tuple[Memory, Memory, float]] = []
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            try:
+                sim = cosine_similarity(group[i].embedding, group[j].embedding)
+            except ValueError:
+                continue
+            if sim > threshold:
+                out.append((group[i], group[j], sim))
+    return out
 
 
 # ── LLM 融合 ──────────────────────────────────────────────
@@ -279,3 +349,44 @@ async def consolidate_memories(dry_run: bool = False) -> ConsolidationReport:
     set_meta("last_consolidation_at", utc_now().isoformat())
 
     return report
+
+
+# ── P4-③：自动触发 ────────────────────────────────────────
+
+
+async def maybe_auto_consolidate() -> ConsolidationReport | None:
+    """
+    会话结束、写入完成后调用。规模越线且候选够多时自动合并一次。
+
+    返回 None 表示本次没触发（开关关闭 / 规模未到 / 候选不足）。
+
+    ★ 默认关闭（CONSOLIDATE_AUTO_ENABLED=false）：自动合并会在用户退出时静默
+      发起若干次 LLM 调用，这个代价必须由用户显式同意。开启前请先用
+      `/consolidate preview` 看看候选对长什么样。
+
+    ★ 性能前提已就位：find_merge_candidates 的两两比较改成了分块矩阵乘
+      （见 _pairs_above_threshold），否则 N=10000 时这里会直接卡死。
+    """
+    from config import (
+        CONSOLIDATE_AUTO_ENABLED,
+        CONSOLIDATE_AUTO_THRESHOLD,
+        CONSOLIDATE_MIN_PAIRS,
+    )
+
+    if not CONSOLIDATE_AUTO_ENABLED:
+        return None
+
+    memories = list_active_memories()
+    epi_emo = [m for m in memories if m.type in ("episodic", "emotional")]
+    if len(epi_emo) <= CONSOLIDATE_AUTO_THRESHOLD:
+        return None
+
+    pairs = find_merge_candidates(memories)
+    if len(pairs) < CONSOLIDATE_MIN_PAIRS:
+        return None
+
+    logger.info(
+        "活跃 episodic/emotional %d 条、候选 %d 对，自动执行合并。",
+        len(epi_emo), len(pairs),
+    )
+    return await consolidate_memories(dry_run=False)

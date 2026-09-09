@@ -55,6 +55,7 @@ class EngramTideMCPManager:
                 "created": True,
                 "surfaced_memory_count": len(session.surfaced_memories),
                 "decay_report": asdict(session.decay_report),
+                "maintenance_report": asdict(session.maintenance_report),
             }
 
     async def prepare_turn(
@@ -151,6 +152,18 @@ class EngramTideMCPManager:
     async def delete_memories(self, memory_ids: Iterable[str]) -> dict[str, int]:
         async with self._lock:
             return {"deleted": self.engine.delete_memories(memory_ids)}
+
+    async def memory_stats(self) -> dict[str, Any]:
+        async with self._lock:
+            return self.engine.stats()
+
+    async def search_archive(self, query_text: str, limit: int = 10) -> list[dict[str, Any]]:
+        async with self._lock:
+            return [r.to_dict() for r in self.engine.search_archive(query_text, limit)]
+
+    async def run_maintenance(self) -> dict[str, Any]:
+        async with self._lock:
+            return asdict(self.engine.run_maintenance(force=True))
 
     async def shutdown(self) -> None:
         async with self._lock:
