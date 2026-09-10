@@ -77,8 +77,8 @@ def _debug(msg: str) -> None:
 
 WELCOME = r"""
 ╔══════════════════════════════════════╗
-║        🧠 Memory Engine             ║
-║    AI 长期记忆系统 · Phase 4         ║
+║            🧠 EngramTide             ║
+║        AI Agent 的长期记忆层         ║
 ╚══════════════════════════════════════╝
 
 命令:
@@ -207,7 +207,7 @@ async def main_loop() -> None:
             log_access_events_batch([(mid, source) for mid in surfaced_ids])
 
     if not CONTEXT_AWARE_ENABLED:
-        logger.info("⚠ Context-Aware 激活已通过环境变量关闭（Phase 2 等价模式）")
+        logger.info("⚠ Context-Aware 激活已通过环境变量关闭（沉底记忆不会被当前输入唤醒）")
 
     # Phase 4：启动时检查记忆库规模（复用上面已加载的列表，不再多查一次）
     epi_emo_count = sum(1 for m in all_mems if m.type in ("episodic", "emotional"))

@@ -18,6 +18,9 @@ async def test_mcp_exposes_expected_tools_and_safe_transport_defaults():
         "list_memories",
         "export_memories",
         "delete_memories",
+        "memory_stats",
+        "search_archive",
+        "run_maintenance",
     }
     assert mcp.settings.host == "127.0.0.1"
     assert mcp.settings.streamable_http_path == "/mcp"
