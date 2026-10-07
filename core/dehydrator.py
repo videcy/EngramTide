@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,9 @@ class SplitReport:
     segments: int       # 分割段数（回退时为 1）
     fell_back: bool     # 是否回退到整段脱水
     reason: str = ""    # 回退原因（LLM 失败 / JSON 非法 / 索引越界…）
+    # 脱水失败段在输入消息里的下标区间 [start, end]（闭区间）。
+    # 调用方据此只把成功段对应的原文标记为已处理。
+    failed_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -442,12 +445,16 @@ async def dehydrate_conversation(
     all_memories: list[Memory] = []
     failed_segments = 0
     last_error: Exception | None = None
+    offset = 0  # 段是输入的连续切片（尾部合并后也是），累加长度即得下标
     for i, seg in enumerate(segments):
+        seg_start = offset
+        offset += len(seg)
         try:
             seg_memories = await _dehydrate_segment(seg, source_conv_id)
         except Exception as e:
             failed_segments += 1
             last_error = e
+            split_report.failed_ranges.append((seg_start, offset - 1))
             logger.warning(
                 "段 %d/%d 脱水失败: %s，跳过该段（其余段不受影响）",
                 i + 1, len(segments), e,
