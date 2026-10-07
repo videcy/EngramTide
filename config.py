@@ -243,6 +243,26 @@ CONSOLIDATE_BLOCK_SIZE: int = int(
 )                                       # 候选对矩阵分块行数，控 O(N²) 峰值内存
 
 
+# ── Claude Code hook 注入 ─────────────────────────────────
+
+HOOK_ENABLED: bool = (
+    _get_env("HOOK_ENABLED", "true").lower() != "false"
+)                                       # ★ false 时 hook 路由一律返回空 body（对照实验）
+HOOK_DEDUP_INJECTED: bool = (
+    _get_env("HOOK_DEDUP_INJECTED", "true").lower() != "false"
+)                                       # ★ false 时每轮完整注入，不排除本会话已注入的记忆
+HOOK_MIN_PROMPT_CHARS: int = int(_get_env("HOOK_MIN_PROMPT_CHARS", "4") or "4")
+HOOK_MAX_CONTEXT_CHARS: int = int(
+    _get_env("HOOK_MAX_CONTEXT_CHARS", "9000") or "9000"
+)                                       # Claude Code 对 additionalContext 的上限是 10000 字符
+HOOK_EMBED_TIMEOUT_SECONDS: float = float(
+    _get_env("HOOK_EMBED_TIMEOUT_SECONDS", "4") or "4"
+)                                       # 必须小于 settings 里 hook 的 timeout
+HOOK_BUFFER_RETENTION_DAYS: int = int(
+    _get_env("HOOK_BUFFER_RETENTION_DAYS", "7") or "7"
+)                                       # 已脱水对话原文的保留期；未脱水的永不自动清理
+
+
 # ── 启动检查 ──────────────────────────────────────────────
 
 def check_config() -> list[str]:
@@ -281,6 +301,12 @@ def check_config() -> list[str]:
             f"激活阈值分层非法：要求 0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1，"
             f"当前 MID={SIMILARITY_MID}、HIGH={SIMILARITY_HIGH}。\n"
             f"  MID >= HIGH 会使轻激活带 (MID, HIGH] 为空集，轻激活机制失效。"
+        )
+
+    if not (0 < HOOK_MAX_CONTEXT_CHARS <= 10_000):
+        errors.append(
+            f"HOOK_MAX_CONTEXT_CHARS={HOOK_MAX_CONTEXT_CHARS} 非法：要求 0 < 值 <= 10000。\n"
+            f"  超过 10000 字符时 Claude Code 会把注入内容转存成文件，只留预览。"
         )
 
     # Phase 5 消融开关互斥检查（warning 而非 error——全部 off 本身就是 A4 正对照）

@@ -23,6 +23,7 @@ from core.memory_store import (
     archive_memories,
     collect_archive_candidates,
     get_meta,
+    prune_dehydrated_turns,
     prune_event_logs,
     purge_superseded,
     set_meta,
@@ -43,6 +44,7 @@ class MaintenanceReport:
     archived: int = 0        # 移入归档表的条数
     purged: int = 0          # 硬删除的 superseded 条数
     pruned_events: int = 0   # 清理的埋点事件行数
+    pruned_turns: int = 0    # 清理的已脱水对话缓冲行数
 
 
 def _next_session_count() -> int:
@@ -81,6 +83,12 @@ def run_maintenance(
     except Exception as e:
         logger.warning("清理埋点事件失败: %s", e)
 
+    # ①' 已脱水的对话原文过了保留期就删；未脱水的不动
+    try:
+        report.pruned_turns = prune_dehydrated_turns(now=now)
+    except Exception as e:
+        logger.warning("清理对话缓冲失败: %s", e)
+
     if not config.ARCHIVE_ENABLED:
         set_meta(_LAST_RUN_KEY, now.isoformat())
         return report
@@ -101,10 +109,10 @@ def run_maintenance(
 
     set_meta(_LAST_RUN_KEY, now.isoformat())
 
-    if report.archived or report.purged or report.pruned_events:
+    if report.archived or report.purged or report.pruned_events or report.pruned_turns:
         logger.info(
-            "记忆库维护: 归档 %d 条, 硬删 supersede %d 条, 清理埋点 %d 行",
-            report.archived, report.purged, report.pruned_events,
+            "记忆库维护: 归档 %d 条, 硬删 supersede %d 条, 清理埋点 %d 行, 清理对话缓冲 %d 行",
+            report.archived, report.purged, report.pruned_events, report.pruned_turns,
         )
     return report
 
