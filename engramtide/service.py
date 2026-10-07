@@ -21,11 +21,15 @@ import html
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable
 
 import config
 import core.memory_store as memory_store
+from core.consolidator import consolidate_memories, find_merge_candidates_capped
 from core.context_builder import ConstitutionalMemoryContext
+from core.dehydrator import dehydrate_conversation
+from core.memory_writer import write_memories
 from engramtide import api
 from engramtide.api import EngramTide, EngramTideSession
 from utils.time_utils import utc_now
@@ -112,6 +116,8 @@ class MemoryService:
         self._sessions: OrderedDict[str, _HookSession] = OrderedDict()
         self._last_used: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._dehydrating: set[str] = set()
+        self._consolidating = False
 
     # ── hook 读路径 ──────────────────────────────────────
 
@@ -202,6 +208,203 @@ class MemoryService:
             if hook_session is not None:
                 hook_session.injected_ids.clear()
                 hook_session.header_sent = False
+
+    # ── MCP 写路径 ───────────────────────────────────────
+    #
+    # 下面的方法都不持锁跨 LLM / embedding 调用：脱水一次要几秒，持锁会让所有
+    # 会话的 hook 注入超时。写库部分（write_memories 等）内部没有 await，
+    # 在事件循环上天然是原子的。
+
+    async def dehydrate(
+        self,
+        session_id: str | None = None,
+        *,
+        scope: str = "session",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Turn buffered, not-yet-dehydrated turns into memories.
+
+        scope="session": one session (``session_id``, or the only session with
+        pending turns).  scope="pending": every session with pending turns.
+        The turn still in progress (user prompt without a reply yet, in a live
+        session) is left for next time.
+        """
+        if scope not in ("session", "pending"):
+            raise ValueError('scope must be "session" or "pending"')
+
+        summary = memory_store.pending_turn_summary()
+        if scope == "pending":
+            targets = [row["session_id"] for row in summary]
+        elif session_id:
+            targets = [session_id]
+        elif len(summary) <= 1:
+            targets = [row["session_id"] for row in summary]
+        else:
+            raise ValueError(
+                "multiple sessions have pending turns; pass session_id or "
+                "scope=\"pending\": "
+                + ", ".join(f"{r['session_id']} ({r['pending']})" for r in summary)
+            )
+
+        results = [await self._dehydrate_one(sid, dry_run) for sid in targets]
+        return {
+            "dry_run": dry_run,
+            "sessions": results,
+            "extracted_memories": sum(r.get("extracted_memories", 0) for r in results),
+        }
+
+    async def _dehydrate_one(self, session_id: str, dry_run: bool) -> dict[str, Any]:
+        result: dict[str, Any] = {"session_id": session_id}
+        if session_id in self._dehydrating:
+            result["skipped"] = "dehydration already running for this session"
+            return result
+
+        rows = self._complete_pending_rows(session_id)
+        if not rows:
+            result["skipped"] = "no pending turns"
+            return result
+
+        self._dehydrating.add(session_id)
+        try:
+            messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+            try:
+                memories, split_report = await dehydrate_conversation(messages, session_id)
+            except Exception as exc:  # noqa: BLE001 — 所有段都失败：一行都不标记
+                result["error"] = f"dehydration failed: {exc}"
+                result["pending_messages"] = len(rows)
+                return result
+
+            result["messages"] = len(rows)
+            result["extracted_memories"] = len(memories)
+            result["memories"] = [
+                {"type": m.type, "content": m.content} for m in memories
+            ]
+            result["split"] = {
+                "segments": split_report.segments,
+                "fell_back": split_report.fell_back,
+                "failed_ranges": [list(r) for r in split_report.failed_ranges],
+            }
+            if dry_run:
+                return result
+
+            failed = {
+                i
+                for start, end in split_report.failed_ranges
+                for i in range(start, end + 1)
+            }
+            # 先写记忆再打标记：中途崩溃时宁可下次重复脱水（写入管线会去重/强化），
+            # 也不能出现「标记了但没写进去」
+            write_report = await write_memories(memories)
+            done = [r["seq"] for i, r in enumerate(rows) if i not in failed]
+            result["write_report"] = asdict(write_report)
+            result["marked_messages"] = memory_store.mark_turns_dehydrated(done)
+            result["pending_messages"] = len(rows) - len(done)
+            return result
+        finally:
+            self._dehydrating.discard(session_id)
+
+    def _complete_pending_rows(self, session_id: str) -> list[dict]:
+        rows = memory_store.list_pending_turns(session_id)
+        if session_id not in self._sessions or not rows:
+            return rows
+        # 活跃会话里还没等到回复的最后一轮，大概率就是正在调用 dehydrate 的这一轮
+        last_user = next((r for r in reversed(rows) if r["role"] == "user"), None)
+        if last_user is None:
+            return rows
+        answered = any(
+            r["role"] == "assistant" and r["prompt_id"] == last_user["prompt_id"]
+            for r in rows
+        )
+        if answered:
+            return rows
+        return [r for r in rows if r["prompt_id"] != last_user["prompt_id"]]
+
+    async def remember(
+        self,
+        content: str,
+        memory_type: str,
+        *,
+        valence: float = 0.0,
+        arousal: float = 0.0,
+        unresolved: bool = False,
+        tags: Iterable[str] = (),
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        report = await self.engine.remember(
+            content,
+            memory_type,
+            valence=valence,
+            arousal=arousal,
+            unresolved=unresolved,
+            tags=tags,
+            source_conv_id=session_id,
+        )
+        return asdict(report)
+
+    async def search_memories(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        matches = await self.engine.search_memories(query, limit=limit)
+        return [
+            {
+                **match.memory.to_dict(),
+                "score": match.score,
+                "vector_similarity": match.vector_similarity,
+                "keyword_similarity": match.keyword_similarity,
+            }
+            for match in matches
+        ]
+
+    async def consolidate(self, preview: bool = True) -> dict[str, Any]:
+        if preview:
+            pairs, capped = find_merge_candidates_capped(
+                memory_store.list_active_memories()
+            )
+            return {
+                "preview": True,
+                "capped": capped,
+                "pairs": [
+                    {
+                        "similarity": sim,
+                        "memories": [
+                            {"memory_id": m.memory_id, "type": m.type, "content": m.content}
+                            for m in (a, b)
+                        ],
+                    }
+                    for a, b, sim in pairs
+                ],
+            }
+        if self._consolidating:
+            raise RuntimeError("consolidation is already running")
+        self._consolidating = True
+        try:
+            report = await consolidate_memories(dry_run=False)
+        finally:
+            self._consolidating = False
+        return {"preview": False, **asdict(report)}
+
+    def forget(self, memory_ids: Iterable[str]) -> dict[str, int]:
+        return {"deleted": self.engine.delete_memories(memory_ids)}
+
+    def restore_archived(self, memory_ids: Iterable[str]) -> dict[str, int]:
+        return {"restored": self.engine.restore_archived(memory_ids)}
+
+    def run_maintenance(self) -> dict[str, Any]:
+        return asdict(self.engine.run_maintenance(force=True))
+
+    def stats(self) -> dict[str, Any]:
+        stats = self.engine.stats()
+        stats["pending_sessions"] = memory_store.pending_turn_summary()
+        return stats
+
+    def list_memories(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 0:
+            raise ValueError("limit must be >= 0")
+        return [record.to_dict() for record in self.engine.list_memories(limit=limit)]
+
+    def export_memories(self) -> list[dict[str, Any]]:
+        return self.engine.export_memories()
+
+    def search_archive(self, query_text: str, limit: int = 10) -> list[dict[str, Any]]:
+        return [r.to_dict() for r in self.engine.search_archive(query_text, limit)]
 
     # ── 生命周期 ─────────────────────────────────────────
 
