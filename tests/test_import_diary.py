@@ -161,3 +161,23 @@ async def test_apply_backdates_predecays_and_is_idempotent(monkeypatch):
     assert episodic.tags == ["学业", "diary"]
     assert episodic.decay_weight == pytest.approx(math.exp(-0.05 * 10))
     assert rows["她是研究生"].decay_weight == 1.0
+
+
+@pytest.mark.asyncio
+async def test_apply_clears_stale_unresolved(monkeypatch):
+    async def fake_embed(text):
+        vec = np.zeros(64, dtype=np.float32)
+        vec[0 if "旧" in text else 1] = 1.0
+        return vec
+
+    monkeypatch.setattr(import_diary, "embed_text", fake_embed)
+    now = datetime(2026, 10, 8, 4, 0, tzinfo=timezone.utc)
+    stale = dict(mem("我明天要问她旧事"), unresolved=True)
+    fresh = dict(mem("我答应周末提醒她"), unresolved=True)
+    await import_diary.apply_plan(make_plan([
+        plan_entry("diary:old", "2026-09-16 04:00:00", [stale]),
+        plan_entry("diary:new", "2026-10-07 04:00:00", [fresh]),
+    ]), now=now, unresolved_days=3)
+
+    rows = {m.content: m.unresolved for m in memory_store.list_active_memories()}
+    assert rows == {"我明天要问她旧事": False, "我答应周末提醒她": True}
