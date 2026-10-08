@@ -16,11 +16,11 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+import config
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -28,7 +28,6 @@ from config import (
     DEHYDRATE_MAX_ITEMS,
     MAX_TOPIC_SEGMENTS,
     MIN_SEGMENT_MESSAGES,
-    PROMPTS_DIR,
     REQUEST_TIMEOUT_SECONDS,
     TOPIC_SPLIT_ENABLED,
 )
@@ -40,9 +39,6 @@ logger = logging.getLogger(__name__)
 # 允许的记忆类型
 _ALLOWED_TYPES = {"semantic", "episodic", "emotional", "procedural"}
 
-# 加载 prompt 模板
-_DEHYDRATE_PROMPT_PATH: Path = PROMPTS_DIR / "dehydrate.txt"
-_TOPIC_SPLIT_PROMPT_PATH: Path = PROMPTS_DIR / "topic_split.txt"
 
 
 # ── 数据结构 ──────────────────────────────────────────────
@@ -81,8 +77,8 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 
 
 def _load_prompt(filename: str) -> str:
-    """加载 prompt 文件。"""
-    path = PROMPTS_DIR / filename
+    """加载 prompt 文件（PROMPTS_OVERRIDE_DIR 优先）。"""
+    path = config.prompt_path(filename)
     if path.exists():
         return path.read_text(encoding="utf-8")
     return ""

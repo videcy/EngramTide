@@ -46,7 +46,7 @@ _EMPTY_SECTION = "无"
 
 
 def _load_template() -> str:
-    path = config.PROMPTS_DIR / "hook_context.txt"
+    path = config.prompt_path("hook_context.txt")
     return path.read_text(encoding="utf-8").strip()
 
 

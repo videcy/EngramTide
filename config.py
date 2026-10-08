@@ -36,6 +36,22 @@ DB_PATH: Path = PROJECT_ROOT / _get_env("MEMORY_DB_PATH", "data/memories.db")
 # Prompts 目录
 PROMPTS_DIR: Path = PROJECT_ROOT / "prompts"
 
+# 部署专用的提示词覆盖目录（相对路径按项目根解析）。目录里有同名文件就用它，
+# 没有就回落到 prompts/。用来给特定 Agent 换口吻，而不改仓库里的通用版本。
+_prompts_override = _get_env("PROMPTS_OVERRIDE_DIR")
+PROMPTS_OVERRIDE_DIR: Path | None = (
+    PROJECT_ROOT / _prompts_override if _prompts_override else None
+)
+
+
+def prompt_path(filename: str) -> Path:
+    """解析提示词文件：覆盖目录优先，其次 prompts/。"""
+    if PROMPTS_OVERRIDE_DIR is not None:
+        candidate = PROMPTS_OVERRIDE_DIR / filename
+        if candidate.is_file():
+            return candidate
+    return PROMPTS_DIR / filename
+
 
 # ── API 配置 ──────────────────────────────────────────────
 
