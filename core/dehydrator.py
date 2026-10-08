@@ -259,7 +259,7 @@ async def split_conversation(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1024,
+        "max_tokens": config.TOPIC_SPLIT_MAX_TOKENS,
     }
 
     try:
@@ -361,7 +361,7 @@ async def _dehydrate_segment(
             {"role": "user", "content": f"请提取以下对话中的记忆：\n\n{conversation_text}"},
         ],
         "temperature": 0.3,
-        "max_tokens": 2048,
+        "max_tokens": config.DEHYDRATE_MAX_TOKENS,
     }
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -374,7 +374,15 @@ async def _dehydrate_segment(
                 response=response,
             )
         data = response.json()
-        raw_output = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        raw_output = choice["message"]["content"] or ""
+
+    if choice.get("finish_reason") == "length":
+        logger.warning(
+            "脱水输出被截断（finish_reason=length，DEHYDRATE_MAX_TOKENS=%d）；"
+            "推理型模型的思考 token 也计入上限，可调大该值",
+            config.DEHYDRATE_MAX_TOKENS,
+        )
 
     raw_items = _extract_json_array(raw_output)
     if not raw_items:

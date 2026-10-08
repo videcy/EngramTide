@@ -116,7 +116,7 @@ async def generate_response(
         "model": DEEPSEEK_CHAT_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 2048,
+        "max_tokens": config.CHAT_MAX_TOKENS,
     }
 
     try:

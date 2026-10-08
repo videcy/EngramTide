@@ -91,6 +91,14 @@ MAX_HISTORY_MESSAGES: int = 20
 DEHYDRATE_MAX_ITEMS: int = 8
 REQUEST_TIMEOUT_SECONDS: int = 60
 
+# LLM 输出 token 上限。推理型模型（如 deepseek-v4-flash）的思考 token 也计入
+# max_tokens，上限太低会在正文写到一半时截断（finish_reason=length），脱水 JSON
+# 解析失败、整段记忆丢失。只按实际生成量计费，上限给足没有额外成本。
+DEHYDRATE_MAX_TOKENS: int = int(_get_env("DEHYDRATE_MAX_TOKENS", "8192") or "8192")
+TOPIC_SPLIT_MAX_TOKENS: int = int(_get_env("TOPIC_SPLIT_MAX_TOKENS", "4096") or "4096")
+CONSOLIDATE_MAX_TOKENS: int = int(_get_env("CONSOLIDATE_MAX_TOKENS", "2048") or "2048")
+CHAT_MAX_TOKENS: int = int(_get_env("CHAT_MAX_TOKENS", "8192") or "8192")
+
 # ── 默认字段值 ────────────────────────────────────────────
 
 DEFAULT_MEMORY_TYPE: str = "semantic"

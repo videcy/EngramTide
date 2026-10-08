@@ -238,7 +238,7 @@ async def _llm_merge_pair(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 512,
+        "max_tokens": config.CONSOLIDATE_MAX_TOKENS,
     }
 
     try:
