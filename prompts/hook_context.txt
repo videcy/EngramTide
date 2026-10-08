@@ -1,0 +1,5 @@
+<engramtide-memory session="{session_id}">
+以下是关于用户的长期记忆，用来调整你的判断和语气。除非用户问起，不要复述，也不要提及记忆系统。
+调用 EngramTide 的 dehydrate / remember 工具时，session_id 用上面这个。
+{sections}
+</engramtide-memory>

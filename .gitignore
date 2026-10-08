@@ -34,3 +34,7 @@ data/**/*.db-shm
 # 本地改造工作文档（不进仓库）
 EngramTide-轻量化改造指导文档.md
 轻量化改造实施记录.md
+EngramTide-Hook注入改造方案.md
+
+# 部署专用的提示词覆盖
+prompts.local/

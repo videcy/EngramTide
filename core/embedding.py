@@ -77,6 +77,12 @@ def _truncate_to_dim(vec: np.ndarray) -> np.ndarray:
 def _build_url() -> str:
     """构建 embedding API 完整 URL。"""
     base = EMBEDDING_BASE_URL.rstrip("/")
+    # 不少 provider 文档给的 base_url 本身就带 /v1（如 https://api.siliconflow.cn/v1），
+    # 无条件追加会拼出 /v1/v1/embeddings → 404
+    if base.endswith("/v1/embeddings"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/embeddings"
     return f"{base}/v1/embeddings"
 
 

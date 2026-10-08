@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import numpy as np
 
+import config
 from config import (
     CONSOLIDATE_MAX_PAIRS,
     CONSOLIDATE_SIMILARITY,
@@ -22,7 +23,6 @@ from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_CHAT_MODEL,
-    PROMPTS_DIR,
     REQUEST_TIMEOUT_SECONDS,
 )
 from core.embedding import embed_text
@@ -211,7 +211,7 @@ async def _llm_merge_pair(
 
     返回融合后的文本，失败返回 None。
     """
-    prompt_path = PROMPTS_DIR / "consolidate.txt"
+    prompt_path = config.prompt_path("consolidate.txt")
     if not prompt_path.exists():
         logger.error("consolidate.txt 未找到，无法执行融合")
         return None
@@ -238,7 +238,7 @@ async def _llm_merge_pair(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 512,
+        "max_tokens": config.CONSOLIDATE_MAX_TOKENS,
     }
 
     try:

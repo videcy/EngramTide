@@ -36,6 +36,22 @@ DB_PATH: Path = PROJECT_ROOT / _get_env("MEMORY_DB_PATH", "data/memories.db")
 # Prompts 目录
 PROMPTS_DIR: Path = PROJECT_ROOT / "prompts"
 
+# 部署专用的提示词覆盖目录（相对路径按项目根解析）。目录里有同名文件就用它，
+# 没有就回落到 prompts/。用来给特定 Agent 换口吻，而不改仓库里的通用版本。
+_prompts_override = _get_env("PROMPTS_OVERRIDE_DIR")
+PROMPTS_OVERRIDE_DIR: Path | None = (
+    PROJECT_ROOT / _prompts_override if _prompts_override else None
+)
+
+
+def prompt_path(filename: str) -> Path:
+    """解析提示词文件：覆盖目录优先，其次 prompts/。"""
+    if PROMPTS_OVERRIDE_DIR is not None:
+        candidate = PROMPTS_OVERRIDE_DIR / filename
+        if candidate.is_file():
+            return candidate
+    return PROMPTS_DIR / filename
+
 
 # ── API 配置 ──────────────────────────────────────────────
 
@@ -74,6 +90,14 @@ TOP_K_RETRIEVE: int = 5
 MAX_HISTORY_MESSAGES: int = 20
 DEHYDRATE_MAX_ITEMS: int = 8
 REQUEST_TIMEOUT_SECONDS: int = 60
+
+# LLM 输出 token 上限。推理型模型（如 deepseek-v4-flash）的思考 token 也计入
+# max_tokens，上限太低会在正文写到一半时截断（finish_reason=length），脱水 JSON
+# 解析失败、整段记忆丢失。只按实际生成量计费，上限给足没有额外成本。
+DEHYDRATE_MAX_TOKENS: int = int(_get_env("DEHYDRATE_MAX_TOKENS", "8192") or "8192")
+TOPIC_SPLIT_MAX_TOKENS: int = int(_get_env("TOPIC_SPLIT_MAX_TOKENS", "4096") or "4096")
+CONSOLIDATE_MAX_TOKENS: int = int(_get_env("CONSOLIDATE_MAX_TOKENS", "2048") or "2048")
+CHAT_MAX_TOKENS: int = int(_get_env("CHAT_MAX_TOKENS", "8192") or "8192")
 
 # ── 默认字段值 ────────────────────────────────────────────
 
@@ -243,6 +267,26 @@ CONSOLIDATE_BLOCK_SIZE: int = int(
 )                                       # 候选对矩阵分块行数，控 O(N²) 峰值内存
 
 
+# ── Claude Code hook 注入 ─────────────────────────────────
+
+HOOK_ENABLED: bool = (
+    _get_env("HOOK_ENABLED", "true").lower() != "false"
+)                                       # ★ false 时 hook 路由一律返回空 body（对照实验）
+HOOK_DEDUP_INJECTED: bool = (
+    _get_env("HOOK_DEDUP_INJECTED", "true").lower() != "false"
+)                                       # ★ false 时每轮完整注入，不排除本会话已注入的记忆
+HOOK_MIN_PROMPT_CHARS: int = int(_get_env("HOOK_MIN_PROMPT_CHARS", "4") or "4")
+HOOK_MAX_CONTEXT_CHARS: int = int(
+    _get_env("HOOK_MAX_CONTEXT_CHARS", "9000") or "9000"
+)                                       # Claude Code 对 additionalContext 的上限是 10000 字符
+HOOK_EMBED_TIMEOUT_SECONDS: float = float(
+    _get_env("HOOK_EMBED_TIMEOUT_SECONDS", "4") or "4"
+)                                       # 必须小于 settings 里 hook 的 timeout
+HOOK_BUFFER_RETENTION_DAYS: int = int(
+    _get_env("HOOK_BUFFER_RETENTION_DAYS", "7") or "7"
+)                                       # 已脱水对话原文的保留期；未脱水的永不自动清理
+
+
 # ── 启动检查 ──────────────────────────────────────────────
 
 def check_config() -> list[str]:
@@ -269,7 +313,7 @@ def check_config() -> list[str]:
     if not EMBEDDING_BASE_URL:
         errors.append(
             "缺少 EMBEDDING_BASE_URL 环境变量。\n"
-            "  请填写 embedding 服务的基础 URL（代码会追加 /v1/embeddings）。"
+            "  请填写 embedding 服务的基础 URL（以 /v1 结尾或不带都可以，代码会补全为 /v1/embeddings）。"
         )
 
     dim_error = check_embedding_dim()
@@ -281,6 +325,12 @@ def check_config() -> list[str]:
             f"激活阈值分层非法：要求 0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1，"
             f"当前 MID={SIMILARITY_MID}、HIGH={SIMILARITY_HIGH}。\n"
             f"  MID >= HIGH 会使轻激活带 (MID, HIGH] 为空集，轻激活机制失效。"
+        )
+
+    if not (0 < HOOK_MAX_CONTEXT_CHARS <= 10_000):
+        errors.append(
+            f"HOOK_MAX_CONTEXT_CHARS={HOOK_MAX_CONTEXT_CHARS} 非法：要求 0 < 值 <= 10000。\n"
+            f"  超过 10000 字符时 Claude Code 会把注入内容转存成文件，只留预览。"
         )
 
     # Phase 5 消融开关互斥检查（warning 而非 error——全部 off 本身就是 A4 正对照）

@@ -224,52 +224,95 @@ async def run_conversation(agent, user_inputs: list[str]) -> list[str]:
 | `list_memories()` / `get_memory()` | 查看当前记忆 |
 | `export_memories()` | 导出不含 embedding 的 JSON-compatible 数据 |
 | `delete_memories()` | 硬删除记忆及其访问/衰减日志 |
+| `remember()` | 显式写入一条记忆，走类型感知写入管线 |
+| `search_memories()` | 纯读检索：不激活、不计访问、不改权重 |
 
 Python API 当前采用单进程、单 SQLite 数据库模型；不要在同一进程中并行创建指向不同
 数据库的多个 `EngramTide` 实例。`prepare_turn()` 会记录用户消息，宿主生成回复后应
 调用 `add_message("assistant", response)`。若宿主最终没有采用某些记忆，可以向
 `acknowledge_used(turn_id, memory_ids=[...])` 只传实际使用的 ID。
 
-### MCP Server（Streamable HTTP）
+### Claude Code：hook 注入 + MCP 写入
 
-EngramTide 可以作为本机或可信局域网中的单用户 MCP Server 运行：
+EngramTide 以单进程服务运行，同时提供两类接口，共用一个 SQLite 连接、一份向量缓存
+和一份会话状态：
+
+| 接口 | 端点 | 职责 |
+| --- | --- | --- |
+| HTTP hook | `/hooks/claude-code/*` | **读**：每轮自动注入记忆；记录对话原文 |
+| MCP | `/mcp` | **写**：脱水、显式写入、合并、删除，以及只读的查询和统计 |
+
+记忆注入不靠模型调用工具：Claude Code 每次提交 prompt 都会触发 `UserPromptSubmit`
+hook，服务端完成激活、检索和预算截断后，以 `additionalContext` 返回。hook 从不写
+记忆；记忆只在显式调用 MCP 工具时写入。
+
+**1. 启动服务**
 
 ```powershell
 python -m engramtide.mcp
 ```
 
-默认端点 `http://127.0.0.1:8765/mcp`。在支持 Streamable HTTP 的 MCP 客户端中添加：
+**2. 注册 MCP（写入工具）**
+
+```bash
+claude mcp add --transport http engramtide http://127.0.0.1:8765/mcp
+```
+
+**3. 配置 hook**（`~/.claude/settings.json`）
 
 ```json
 {
-  "mcpServers": {
-    "engramtide": {
-      "type": "streamable-http",
-      "url": "http://127.0.0.1:8765/mcp"
-    }
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "http", "url": "http://127.0.0.1:8765/hooks/claude-code/user-prompt-submit", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "http", "url": "http://127.0.0.1:8765/hooks/claude-code/stop", "timeout": 5 } ] }
+    ],
+    "PostCompact": [
+      { "hooks": [ { "type": "http", "url": "http://127.0.0.1:8765/hooks/claude-code/post-compact", "timeout": 5 } ] }
+    ]
   }
 }
 ```
 
-不同客户端对 `type` 字段的名称可能略有区别，连接 URL 保持不变。
+三个 hook 各管一件事：
 
-推荐的 Agent 调用顺序：
+| hook | 做什么 |
+| --- | --- |
+| `UserPromptSubmit` | 记录用户输入；首个 prompt 时懒建会话（衰减 + 维护 + 浮现）；逐轮激活、检索并注入。注入的记忆当轮计访问 |
+| `Stop` | 记录本轮助手的最终回复，供之后脱水 |
+| `PostCompact` | 上下文压缩后，允许之前注入过的记忆再次注入 |
 
-1. 对话开始调用 `start_session`，保存返回的显式 `session_id`。
-2. 每轮生成回复前调用 `prepare_turn(session_id, user_input, turn_id)`，将返回的四类
-   `memory_context` 注入 Agent prompt。
-3. 回复生成成功后调用 `commit_turn(session_id, turn_id, assistant_message)`；该调用
-   确认实际使用的记忆并记录回复，重复提交同一 `turn_id` 不会重复计数或写入对话。
-4. 正常结束时调用 `end_session`，执行话题分割、脱水和记忆写入；放弃会话时调用
-   `close_session`，后者不会提取新记忆。
+同一会话里已注入的记忆不会重复注入（它们还在上下文里）。斜杠命令和过短的输入只记录、
+不注入。服务出故障时 hook 一律返回空响应，**不会阻塞或打扰用户的输入**。
 
-除上述会话工具外，MCP Server 还提供 `list_memories`、`export_memories`、
-`delete_memories`、`memory_stats`、`search_archive` 和 `run_maintenance` 六个管理工具，
-CLI 上的可观测性和维护能力在 MCP 侧同样可用。其中 `delete_memories` 是不可恢复的
-硬删除，宿主 Agent 应在调用前获得用户明确确认。
+不支持 `type: "http"` 的旧版 Claude Code 可改用 command hook，脚本只依赖标准库：
+
+```json
+{ "type": "command", "command": "python /path/to/EngramTide/scripts/claude_hook.py user-prompt-submit" }
+```
+
+`stop` 和 `post-compact` 同理。
+
+**4. 写入记忆**
+
+| 工具 | 作用 |
+| --- | --- |
+| `dehydrate` | 把对话原文中尚未处理的部分话题分割、脱水并写入。可重复调用，只处理新增轮次；`scope="pending"` 补扫所有会话；`dry_run` 只预览 |
+| `remember` | 显式写一条记忆，覆盖/强化/去重规则照常生效 |
+| `consolidate` | 合并近重复记忆，默认只预览 |
+| `forget` | 不可恢复的硬删除，调用前应获得用户明确确认 |
+| `restore_archived` / `run_maintenance` | 恢复归档记忆 / 立即执行维护 |
+| `search_memories` | 显式查询，**纯读**：不激活、不计访问 |
+| `list_memories` / `export_memories` / `memory_stats` / `search_archive` | 查看、导出、统计（含待脱水会话）、翻查归档 |
+
+脱水只在调用 `dehydrate` 时发生。注入块 `<engramtide-memory session="…">` 携带当前
+会话 ID，模型调用时直接使用。没来得及脱水的对话原文会一直保留在库里，之后随时可以用
+`dehydrate(scope="pending")` 补上。
 
 <details>
-<summary>MCP 环境变量与网络安全说明</summary>
+<summary>环境变量与网络安全说明</summary>
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -278,15 +321,25 @@ CLI 上的可观测性和维护能力在 MCP 侧同样可用。其中 `delete_me
 | `ENGRAMTIDE_MCP_PATH` | `/mcp` | Streamable HTTP 端点路径 |
 | `ENGRAMTIDE_MCP_ALLOWED_HOSTS` | 本机 Host | 非本机监听时必填，多个值用逗号分隔 |
 | `ENGRAMTIDE_MCP_ALLOWED_ORIGINS` | 本机 Origin | 浏览器客户端跨域访问时按需配置 |
-| `ENGRAMTIDE_DB_PATH` | 继承 `MEMORY_DB_PATH` | MCP 实例使用的 SQLite 文件 |
+| `ENGRAMTIDE_DB_PATH` | 继承 `MEMORY_DB_PATH` | 服务使用的 SQLite 文件 |
 | `ENGRAMTIDE_SESSION_TTL_SECONDS` | `86400` | 空闲会话过期时间 |
-| `ENGRAMTIDE_MAX_SESSIONS` | `32` | 同时保留的显式会话上限 |
+| `ENGRAMTIDE_MAX_SESSIONS` | `32` | 同时保留的会话上限，超出时淘汰最久未用的 |
+| `ENGRAMTIDE_HOOK_TOKEN` | 空 | 设置后 hook 请求必须带 `Authorization: Bearer <token>`（settings 中用 `headers` + `allowedEnvVars` 传入） |
+| `HOOK_ENABLED` | `true` | 关闭后只记录对话原文、不注入 |
+| `HOOK_DEDUP_INJECTED` | `true` | 关闭后每轮完整注入 |
+| `HOOK_MIN_PROMPT_CHARS` | `4` | 更短的输入不注入 |
+| `HOOK_MAX_CONTEXT_CHARS` | `9000` | 注入文本上限（Claude Code 上限 10000） |
+| `HOOK_EMBED_TIMEOUT_SECONDS` | `4` | 超时即放弃本轮注入；须小于 hook 的 `timeout` |
+| `HOOK_BUFFER_RETENTION_DAYS` | `7` | 已脱水对话原文的保留期；未脱水的永不自动清理 |
 
-此版本不提供 OAuth 或 Token 鉴权。默认仅绑定回环地址；只有在网络内所有设备均可信、
+MCP 端点不提供 OAuth 或 Token 鉴权。默认仅绑定回环地址；只有在网络内所有设备均可信、
 且有防火墙隔离时才应监听 `0.0.0.0`。此时必须将实际服务器地址（含端口）写入
-`ENGRAMTIDE_MCP_ALLOWED_HOSTS`；浏览器型客户端还需配置 Origin。服务始终启用官方
-SDK 的 DNS rebinding 防护。显式会话保存在 MCP Server 进程内，服务重启后应重新调用
-`start_session`；已写入 SQLite 的长期记忆不受影响。**不要直接将该端口暴露到公网。**
+`ENGRAMTIDE_MCP_ALLOWED_HOSTS`；浏览器型客户端还需配置 Origin。MCP 和 hook 端点都
+启用官方 SDK 的 Host/Origin 校验。会话状态保存在进程内，服务重启后会在下一个 prompt
+时自动重建；长期记忆和对话原文都在 SQLite 中，不受影响。**不要直接将该端口暴露到公网。**
+
+对话原文（`conversation_turns` 表）是脱水的输入，含用户的完整对话内容。`memory_stats`
+会显示其行数，脱水后按保留期清理。
 
 </details>
 
@@ -370,7 +423,9 @@ EngramTide/
 ├── main.py                # CLI 主循环（衰减→浮现→逐轮激活→检索→上下文→写入）
 ├── engramtide/
 │   ├── api.py             # EngramTide / EngramTideSession Facade
-│   └── mcp/               # Streamable HTTP MCP Server 与会话适配层
+│   ├── service.py         # MemoryService：hook 注入读路径 + MCP 写路径
+│   ├── hooks/             # Claude Code HTTP hook 路由（UserPromptSubmit / Stop / PostCompact）
+│   └── mcp/               # Streamable HTTP 服务：MCP 工具 + 挂载 hook 路由
 ├── core/
 │   ├── memory_store.py    # SQLite 存储层（CRUD + meta + FTS5 + 归档表）
 │   ├── vector_index.py    # 进程内归一化向量矩阵缓存（一次矩阵乘算全量相似度）
@@ -383,12 +438,13 @@ EngramTide/
 │   ├── decay.py           # 衰减引擎 + 浮现 + 逐轮激活
 │   ├── memory_writer.py   # 类型感知写入管线
 │   └── consolidator.py    # 记忆合并与去重
-├── prompts/               # 交互宪法 / 脱水 / 话题分割 / 记忆融合
+├── prompts/               # 交互宪法 / hook 注入模板 / 脱水 / 话题分割 / 记忆融合
 ├── utils/                 # 余弦相似度、UTC 时间工具、Token 保守估算器
 ├── scripts/
 │   ├── rebuild_embeddings.py    # 改维度/换模型后的全库 embedding 重建
-│   └── calibrate_thresholds.py  # SIMILARITY_MID / HIGH 重标定（P95/P25 协议）
-├── tests/                 # 单元 + 集成测试（342 项）
+│   ├── calibrate_thresholds.py  # SIMILARITY_MID / HIGH 重标定（P95/P25 协议）
+│   └── claude_hook.py           # 旧版 Claude Code 的 command hook 兜底（仅标准库）
+├── tests/                 # 单元 + 集成测试（401 项）
 └── data/                  # SQLite 数据库存放目录
 ```
 
@@ -403,7 +459,7 @@ EngramTide/
 - **LLM：** DeepSeek（OpenAI-compatible 接口）
 - **Embedding：** 独立 OpenAI-compatible `/v1/embeddings` provider
 - **关键词索引：** SQLite 内置 FTS5（`trigram` 分词，零新依赖）；rapidfuzz 作二级降级
-- **Agent 协议：** MCP Streamable HTTP（官方 Python SDK）
+- **Agent 协议：** Claude Code HTTP hook（注入）+ MCP Streamable HTTP（写入，官方 Python SDK）
 
 ### 运行测试
 
@@ -411,9 +467,10 @@ EngramTide/
 pytest -p asyncio -o asyncio_mode=auto
 ```
 
-测试套件共 **342 项**，覆盖衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、
-双通道打分、Token 预算截断、会话上限、合并候选与端到端、Python API 与 MCP
-会话/幂等/工具发现契约、功能开关回退等价性和核心流程回归。其中包含严格的毫秒级性能
+测试套件共 **401 项**，覆盖衰减数学、激活阈值边界、浮现筛选、写入管线、话题分割回退、
+双通道打分、Token 预算截断、会话上限、合并候选与端到端、Python API、hook 注入
+（去重/重放/fail-open/安全校验）与 Python API 路径的逐字段等价性、脱水增量与幂等、
+MCP 工具发现契约、功能开关回退等价性和核心流程回归。其中包含严格的毫秒级性能
 基准，结果会受到机器负载与硬件性能影响。
 
 ## 许可证

@@ -221,6 +221,32 @@ CREATE TABLE IF NOT EXISTS access_events (
 """
 
 
+# ── Hook 对话缓冲（原始对话日志，不是记忆）──────────────────
+#
+# UserPromptSubmit 记用户输入、Stop 记助手最终回复；MCP dehydrate 从这里取
+# 未脱水的轮次。seq 决定对话顺序（created_at 精度不够区分同秒的两条）。
+# dehydrated_at IS NULL = 待脱水；这类行永远不被自动清理（记忆零丢失）。
+
+CREATE_CONVERSATION_TURNS_SQL = """
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     TEXT NOT NULL,
+    prompt_id      TEXT NOT NULL,
+    role           TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content        TEXT NOT NULL,
+    cwd            TEXT,
+    created_at     TEXT NOT NULL,
+    dehydrated_at  TEXT,
+    UNIQUE (session_id, prompt_id, role)
+);
+"""
+
+CREATE_CONVERSATION_TURNS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_turns_pending
+ON conversation_turns(dehydrated_at, session_id);
+"""
+
+
 # ── P2：FTS5 关键词倒排索引 ────────────────────────────────
 
 # 外部内容表（content='memories'）——索引不复制一份 content，只存倒排项。
@@ -340,6 +366,10 @@ def init_db() -> None:
     conn.execute(CREATE_ACCESS_EVENTS_SQL)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_decay_events_ts ON decay_events(ts);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_access_events_ts ON access_events(ts);")
+
+    # Hook 对话缓冲
+    conn.execute(CREATE_CONVERSATION_TURNS_SQL)
+    conn.execute(CREATE_CONVERSATION_TURNS_INDEX_SQL)
     conn.commit()
 
     _ensure_embedding_dim_meta(conn)
@@ -927,6 +957,118 @@ def query_access_events(memory_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── Hook 对话缓冲 ─────────────────────────────────────────
+
+_TURN_COLUMNS = "seq, session_id, prompt_id, role, content, cwd, created_at"
+
+
+def upsert_turn(
+    session_id: str,
+    prompt_id: str,
+    role: str,
+    content: str,
+    cwd: str | None = None,
+) -> None:
+    """
+    记一条对话原文。同一 (session_id, prompt_id, role) 重复写入时覆盖 content。
+
+    Stop 在一轮内可能触发多次，取最后一次的回复；已脱水的行不再被改写，
+    免得「库里的记忆」和「缓冲里的原文」对不上。
+    """
+    conn = _get_conn()
+    with conn:
+        conn.execute(
+            "INSERT INTO conversation_turns "
+            "(session_id, prompt_id, role, content, cwd, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, prompt_id, role) DO UPDATE SET "
+            "content = excluded.content "
+            "WHERE conversation_turns.dehydrated_at IS NULL",
+            (session_id, prompt_id, role, content, cwd, utc_now().isoformat()),
+        )
+
+
+def latest_unanswered_prompt_id(session_id: str) -> str | None:
+    """该会话最近一条还没有助手回复的用户输入的 prompt_id（Stop 缺 prompt_id 时兜底）。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT u.prompt_id FROM conversation_turns u "
+        "WHERE u.session_id = ? AND u.role = 'user' AND NOT EXISTS ("
+        "    SELECT 1 FROM conversation_turns a "
+        "    WHERE a.session_id = u.session_id AND a.prompt_id = u.prompt_id "
+        "    AND a.role = 'assistant'"
+        ") ORDER BY u.seq DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    return row["prompt_id"] if row else None
+
+
+def list_pending_turns(session_id: str | None = None) -> list[dict]:
+    """未脱水的对话行，按会话、seq 排序。session_id=None 时返回全部会话。"""
+    conn = _get_conn()
+    if session_id is None:
+        rows = conn.execute(
+            f"SELECT {_TURN_COLUMNS} FROM conversation_turns "
+            "WHERE dehydrated_at IS NULL ORDER BY session_id, seq"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_TURN_COLUMNS} FROM conversation_turns "
+            "WHERE dehydrated_at IS NULL AND session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def pending_turn_summary() -> list[dict]:
+    """每个有待脱水内容的会话：行数与最近一条的时间，最近的排前面。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT session_id, COUNT(*) AS pending, MAX(created_at) AS last_at "
+        "FROM conversation_turns WHERE dehydrated_at IS NULL "
+        "GROUP BY session_id ORDER BY last_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_turns_dehydrated(seqs: list[int]) -> int:
+    """把这些行标记为已脱水，返回实际标记的行数（已标记过的不重复计）。"""
+    if not seqs:
+        return 0
+    conn = _get_conn()
+    now = utc_now().isoformat()
+    marked = 0
+    with conn:
+        for i in range(0, len(seqs), 500):
+            chunk = seqs[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cur = conn.execute(
+                f"UPDATE conversation_turns SET dehydrated_at = ? "
+                f"WHERE dehydrated_at IS NULL AND seq IN ({placeholders})",
+                (now, *chunk),
+            )
+            marked += cur.rowcount
+    return marked
+
+
+def prune_dehydrated_turns(retention_days: int | None = None, now=None) -> int:
+    """删除脱水超过保留期的缓冲行。未脱水的行一律不动。"""
+    days = (
+        config.HOOK_BUFFER_RETENTION_DAYS if retention_days is None else retention_days
+    )
+    if days <= 0:
+        return 0
+    cutoff = ((now or utc_now()) - timedelta(days=days)).isoformat()
+    conn = _get_conn()
+    with conn:
+        cur = conn.execute(
+            "DELETE FROM conversation_turns "
+            "WHERE dehydrated_at IS NOT NULL AND dehydrated_at < ?",
+            (cutoff,),
+        )
+    return cur.rowcount
+
+
 # ── P4：冷归档与增长治理 ──────────────────────────────────
 
 
@@ -1095,6 +1237,11 @@ def memory_stats() -> dict:
     ).fetchone()[0]
     decay_events = conn.execute("SELECT COUNT(*) FROM decay_events").fetchone()[0]
     access_events = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    # 缓冲里是对话原文，体积和隐私都要让用户看得见
+    buffered_turns, pending_turns = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(dehydrated_at IS NULL), 0) "
+        "FROM conversation_turns"
+    ).fetchone()
 
     # WAL 模式下新写入的页先落在 -wal 文件里，只看主库文件会严重低估体积
     db_bytes = 0
@@ -1114,6 +1261,8 @@ def memory_stats() -> dict:
         "net_growth_last_30d": new_this_month - archived_this_month,
         "decay_events": decay_events,
         "access_events": access_events,
+        "buffered_turns": buffered_turns,
+        "pending_turns": pending_turns,
         "db_bytes": db_bytes,
         "fts_enabled": fts_available(),
     }
