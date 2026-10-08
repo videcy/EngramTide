@@ -289,7 +289,7 @@ def check_config() -> list[str]:
     if not EMBEDDING_BASE_URL:
         errors.append(
             "缺少 EMBEDDING_BASE_URL 环境变量。\n"
-            "  请填写 embedding 服务的基础 URL（代码会追加 /v1/embeddings）。"
+            "  请填写 embedding 服务的基础 URL（以 /v1 结尾或不带都可以，代码会补全为 /v1/embeddings）。"
         )
 
     dim_error = check_embedding_dim()
