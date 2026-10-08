@@ -59,7 +59,7 @@ async def test_inject_counts_access_and_records_buffer(embed_calls):
     context = await service.on_user_prompt("s1", "今天下雨了", prompt_id="p1", cwd="/w")
 
     assert context.startswith('<m session="s1">')
-    assert "## 用户事实\n- 用户喜欢在雨天散步" in context
+    assert "## 关于你\n- 用户喜欢在雨天散步" in context
     assert service.engine.get_memory(memory.memory_id).access_count == 1
     [row] = list_pending_turns("s1")
     assert (row["prompt_id"], row["role"], row["content"], row["cwd"]) == (
@@ -247,7 +247,7 @@ def test_render_skips_empty_sections_and_caps_length():
     )
 
     full = render_context(TEMPLATE, 's"1', context, max_chars=10_000)
-    assert "## 偏好与规则" in full and "## 用户事实" not in full
+    assert "## 我们的约定" in full and "## 关于你" not in full
     assert 's&quot;1' in full
 
     capped = render_context(TEMPLATE, "s1", context, max_chars=120)

@@ -37,10 +37,10 @@ from utils.time_utils import utc_now
 logger = logging.getLogger(__name__)
 
 _SECTION_TITLES = (
-    ("procedural_memories", "## 偏好与规则"),
-    ("semantic_memories", "## 用户事实"),
-    ("episodic_memories", "## 近期经历"),
-    ("emotional_memories", "## 情感沉淀"),
+    ("procedural_memories", "## 我们的约定"),
+    ("semantic_memories", "## 关于你"),
+    ("episodic_memories", "## 最近"),
+    ("emotional_memories", "## 心里留下的"),
 )
 _EMPTY_SECTION = "无"
 
