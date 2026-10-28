@@ -1,5 +1,1 @@
-"""Streamable HTTP MCP adapter for EngramTide."""
-
-from engramtide.mcp.manager import EngramTideMCPManager
-
-__all__ = ["EngramTideMCPManager"]
+"""Streamable HTTP server for EngramTide: MCP tools plus Claude Code hooks."""

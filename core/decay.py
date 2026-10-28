@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 
+import config
 from config import (
     BASE_DECAY_RATE,
     DECAY_FLOOR,
@@ -29,6 +30,8 @@ from core.memory_store import (
     Memory,
     get_meta,
     list_active_memories,
+    log_access_events_batch,
+    log_decay_events_batch,
     mark_accessed,
     set_meta,
     update_decay_weights,
@@ -40,26 +43,9 @@ logger = logging.getLogger(__name__)
 # 不衰减的类型集合
 _STATIC_TYPES = {"semantic", "procedural"}
 
-# Phase 5 日志开关（环境变量可控）
-_ACCESS_LOG_ENABLED = (
-    __import__("os").getenv("ACCESS_LOG_ENABLED", "true").lower() != "false"
-)
-
-
-def _log_decay_event(
-    memory_id: str,
-    hours: float,
-    n: int,
-    multiplier: float,
-    floored: bool,
-) -> None:
-    """记录一次衰减事件到 decay_events 表。"""
-    from datetime import datetime, timezone
-
-    from core.memory_store import log_decay_event
-
-    ts = datetime.now(timezone.utc).isoformat()
-    log_decay_event(memory_id, ts, hours, n, multiplier, floored)
+# ★ 埋点开关一律通过 config.XXX 在**调用时**读取，不要在模块顶层 from-import
+#   绑成常量——那样 monkeypatch 改不动，测试与运行时会各看各的值。
+#   （原实现在这里用 os.getenv 自读一份默认值，与 config.py 的默认值会漂移。）
 
 
 # ── 数据结构 ──────────────────────────────────────────────
@@ -144,6 +130,12 @@ def apply_decay(
     skipped = 0
     floored = 0
 
+    # P0：埋点先攒着，循环结束后一次性落库。
+    # 原实现每条记忆一次 commit —— N=5000 就是 5000 次 fsync，会话启动能被拖到几十秒。
+    log_enabled = config.DECAY_LOG_ENABLED
+    decay_events: list[tuple] = []
+    event_ts = utc_now().isoformat()
+
     for mem in memories:
         multiplier = compute_decay_multiplier(
             mem_type=mem.type,
@@ -162,18 +154,25 @@ def apply_decay(
             new_weight = DECAY_FLOOR
             floored += 1
 
-        # Phase 5 日志：记录衰减事件
-        _log_decay_event(
-            mem.memory_id,
-            hours_elapsed,
-            mem.access_count,
-            multiplier,
-            new_weight <= DECAY_FLOOR,
-        )
+        # Phase 5 埋点（默认关闭；开启时攒批）
+        if log_enabled:
+            decay_events.append(
+                (
+                    mem.memory_id,
+                    event_ts,
+                    hours_elapsed,
+                    mem.access_count,
+                    multiplier,
+                    int(new_weight <= DECAY_FLOOR),
+                )
+            )
 
         # 只记录实际变化的条目
         if abs(new_weight - mem.decay_weight) > 1e-12:
             updates.append((new_weight, mem.memory_id))
+
+    if decay_events:
+        log_decay_events_batch(decay_events)
 
     # 实际被更新条数 = 总条数 - 跳过条数（不含触底计数，触底也算更新）
     updated = len(updates)
@@ -407,6 +406,7 @@ def compute_activations(
     memories: list[Memory],
     max_activations: int = MAX_ACTIVATIONS_PER_TURN,
     exclude_mild_ids: frozenset[str] = frozenset(),
+    sims: dict[str, float] | None = None,
 ) -> tuple[list[tuple[str, float, bool]], ActivationReport]:
     """
     对内存中的记忆列表计算激活（不落库、不修改传入对象）。
@@ -434,10 +434,15 @@ def compute_activations(
         SIMILARITY_HIGH,
         SIMILARITY_MID,
     )
-    from utils.similarity import cosine_similarity
+    from core.vector_index import similarity_map
 
     if query_embedding is None:
         return ([], ActivationReport())
+
+    # P1：一次矩阵乘拿到全量相似度。调用方（main / api）已经算过时直接传进来，
+    # 激活与检索共用同一个数组，各自套自己的阈值。
+    if sims is None:
+        sims = similarity_map(query_embedding, memories)
 
     # 收集候选（episodic / emotional，有 embedding，未 superseded）
     # Phase 4：轻激活带命中排除集 → 在截断之前剔除，被抑制条目不占 max_activations 槽位
@@ -450,7 +455,7 @@ def compute_activations(
             continue
         if mem.embedding is None:
             continue
-        sim = cosine_similarity(query_embedding, mem.embedding)
+        sim = sims.get(mem.memory_id, 0.0)
         if sim > SIMILARITY_MID:
             if sim <= SIMILARITY_HIGH and mem.memory_id in exclude_mild_ids:
                 mild_suppressed += 1
@@ -520,6 +525,7 @@ def context_aware_update(
     query_embedding,
     memories: list[Memory] | None = None,
     exclude_mild_ids: frozenset[str] = frozenset(),
+    sims: dict[str, float] | None = None,
 ) -> ActivationReport:
     """
     每轮用户输入后、检索之前调用一次。
@@ -527,9 +533,15 @@ def context_aware_update(
     流程：
     1. CONTEXT_AWARE_ENABLED 为 False → 直接返回空 report。
     2. memories = memories or list_active_memories()
-    3. activations, report = compute_activations(query_embedding, memories, exclude_mild_ids=exclude_mild_ids)
-    4. 权重变化的条目 → update_decay_weights
+    3. activations, report = compute_activations(...)
+    4. 权重变化的条目 → update_decay_weights，**并同步回传入的 Memory 对象**
     5. 强激活条目 → mark_accessed
+
+    ★ 关于第 4 步的权重回写（P1 共用加载的正确性前提）：
+      调用方现在把同一个 memories 列表接着交给检索，而检索打分要乘 decay_weight。
+      原来的顺序是「激活落库 → 检索重新读库」，读到的自然是新权重；共用列表后
+      如果只落库不改内存对象，检索就会拿到**旧权重**，Top-K 结果随之改变。
+      所以这里在落库的同时把新权重写回对象。
     """
     from config import CONTEXT_AWARE_ENABLED
 
@@ -540,7 +552,7 @@ def context_aware_update(
         memories = list_active_memories()
 
     activations, report = compute_activations(
-        query_embedding, memories, exclude_mild_ids=exclude_mild_ids
+        query_embedding, memories, exclude_mild_ids=exclude_mild_ids, sims=sims
     )
 
     if not activations:
@@ -558,16 +570,22 @@ def context_aware_update(
 
     if weight_updates:
         update_decay_weights(weight_updates)
+        # 同步回内存对象，使随后共用同一列表的检索看到新权重
+        new_by_id = {mid: new_w for new_w, mid in weight_updates}
+        for mem in memories:
+            if mem.memory_id in new_by_id:
+                mem.decay_weight = new_by_id[mem.memory_id]
 
     # 强激活计访问
     if report.strong_ids:
         from config import ABL_ACCESS_ACTIVATION
         if ABL_ACCESS_ACTIVATION:
             mark_accessed(report.strong_ids)
-        if _ACCESS_LOG_ENABLED:
-            for mid in report.strong_ids:
-                from core.memory_store import log_access_event
-                source = "strong_activation" if ABL_ACCESS_ACTIVATION else "strong_activation_ablated"
-                log_access_event(mid, source)
+        if config.ACCESS_LOG_ENABLED:
+            source = (
+                "strong_activation" if ABL_ACCESS_ACTIVATION
+                else "strong_activation_ablated"
+            )
+            log_access_events_batch([(mid, source) for mid in report.strong_ids])
 
     return report

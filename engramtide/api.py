@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import numpy as np
+
 import config
 import core.memory_store as memory_store
 from core.context_builder import (
@@ -27,8 +29,12 @@ from core.decay import get_surfaced_memories, run_decay_update
 from core.dehydrator import SplitReport, dehydrate_conversation
 from core.embedding import embed_text
 from core.memory_store import Memory
+from core.maintenance import MaintenanceReport, run_maintenance, search_archive
 from core.memory_writer import WriteReport, write_memories
 from core.retriever import RetrievalDetail, retrieve_memories_detailed
+from core.vector_index import reset_cache, similarity_map
+
+MEMORY_TYPES = ("semantic", "episodic", "emotional", "procedural")
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,8 @@ class EngramTide:
             if Path(memory_store.DB_PATH).resolve() != target:
                 memory_store.close_db()
                 memory_store.DB_PATH = target
+                # 换库必须丢掉进程内的向量矩阵，否则会拿旧库的记忆去打分
+                reset_cache()
 
         memory_store.init_db()
         self.db_path = Path(memory_store.DB_PATH).resolve()
@@ -174,15 +182,101 @@ class EngramTide:
         *,
         now: datetime | None = None,
     ) -> "EngramTideSession":
-        """Run session-start decay and collect (but do not count) surfaced memories."""
+        """Run session-start decay and collect (but do not count) surfaced memories.
+
+        Also runs frequency-gated maintenance (event-log retention, superseded
+        purge, cold archiving) so a long-lived host process still gets an exit
+        path for memory growth.
+        """
         decay_report = run_decay_update(now=now)
+        maintenance_report = run_maintenance(now=now)
         surfaced = get_surfaced_memories(memory_store.list_active_memories(), now=now)
         return EngramTideSession(
             engine=self,
             session_id=session_id or str(uuid.uuid4()),
             decay_report=decay_report,
             surfaced_memories=surfaced,
+            maintenance_report=maintenance_report,
         )
+
+    def stats(self) -> dict[str, Any]:
+        """Memory-growth observability: counts, 30-day net growth, DB size."""
+        return memory_store.memory_stats()
+
+    def search_archive(self, query_text: str, limit: int = 10) -> list[MemoryRecord]:
+        """Search cold-archived memories. Archiving is not deletion."""
+        return [
+            MemoryRecord.from_memory(m) for m in search_archive(query_text, limit)
+        ]
+
+    def restore_archived(self, memory_ids: Iterable[str]) -> int:
+        """Move archived memories back into the hot table."""
+        return memory_store.restore_archived(list(memory_ids))
+
+    def run_maintenance(self, *, force: bool = True) -> MaintenanceReport:
+        """Run archiving / retention maintenance on demand."""
+        return run_maintenance(force=force)
+
+    async def remember(
+        self,
+        content: str,
+        memory_type: str,
+        *,
+        valence: float = 0.0,
+        arousal: float = 0.0,
+        unresolved: bool = False,
+        tags: Iterable[str] = (),
+        source_conv_id: str | None = None,
+    ) -> WriteReport:
+        """Write one explicit memory through the type-aware writing pipeline.
+
+        Override (semantic), reinforcement (emotional), dedup (procedural) and
+        near-duplicate reinforcement (episodic) apply exactly as for dehydrated
+        memories, so the report may show no insertion.
+        """
+        text = content.strip()
+        if not text:
+            raise ValueError("content must be non-empty")
+        if memory_type not in MEMORY_TYPES:
+            raise ValueError(f"memory_type must be one of {', '.join(MEMORY_TYPES)}")
+        if not -1.0 <= valence <= 1.0:
+            raise ValueError("valence must be within [-1, 1]")
+        if not 0.0 <= arousal <= 1.0:
+            raise ValueError("arousal must be within [0, 1]")
+
+        memory = Memory(
+            memory_id=str(uuid.uuid4()),
+            type=memory_type,
+            content=text,
+            valence=valence,
+            arousal=arousal,
+            embedding=await embed_text(text),
+            source_conv_id=source_conv_id,
+            unresolved=unresolved,
+            tags=[t.strip() for t in tags if t.strip()],
+        )
+        return await write_memories([memory])
+
+    async def search_memories(
+        self,
+        query_text: str,
+        *,
+        limit: int = 10,
+    ) -> list[RetrievalMatch]:
+        """Read-only retrieval: no activation, no access counting, no weight change."""
+        text = query_text.strip()
+        if not text:
+            raise ValueError("query_text must be non-empty")
+        if limit <= 0:
+            raise ValueError("limit must be > 0")
+        query_embedding = await embed_text(text)
+        details = retrieve_memories_detailed(
+            query_embedding,
+            memories=memory_store.list_active_memories(),
+            top_k=limit,
+            query_text=text,
+        )
+        return [RetrievalMatch.from_detail(d) for d in details]
 
     def list_memories(self, *, limit: int | None = None) -> list[MemoryRecord]:
         memories = memory_store.list_active_memories()
@@ -224,10 +318,12 @@ class EngramTideSession:
         session_id: str,
         decay_report: DecayReport,
         surfaced_memories: Sequence[Memory],
+        maintenance_report: MaintenanceReport | None = None,
     ) -> None:
         self.engine = engine
         self.session_id = session_id
         self.decay_report = decay_report
+        self.maintenance_report = maintenance_report or MaintenanceReport()
         self.surfaced_memories = tuple(surfaced_memories)
         self._surfaced_ids = {memory.memory_id for memory in surfaced_memories}
         self._surface_acknowledged_ids: set[str] = set()
@@ -258,12 +354,18 @@ class EngramTideSession:
         max_context_tokens: int = config.MAX_CONTEXT_TOKENS,
         debug: bool = False,
         record_user_message: bool = True,
+        query_embedding: np.ndarray | None = None,
+        exclude_ids: Iterable[str] = (),
     ) -> PreparedTurn:
         """Prepare memory context without counting retrieval/surface use.
 
         Strong activation keeps the existing core semantics: it is an input-
         triggered mechanism event and is counted during this method.  Retrieval
         and surfacing are counted only by acknowledge_used().
+
+        query_embedding lets a caller embed outside its own lock; exclude_ids
+        keeps memories already in the host's context out of the budget.  Both
+        leave activation untouched.
         """
         self._ensure_open()
         text = user_input.strip()
@@ -276,22 +378,35 @@ class EngramTideSession:
         if resolved_turn_id in self._prepared:
             raise ValueError(f"turn_id already prepared: {resolved_turn_id}")
 
-        query_embedding = await embed_text(text)
+        if query_embedding is None:
+            query_embedding = await embed_text(text)
+
+        # One load + one similarity matmul per turn, shared by activation and
+        # retrieval.  context_aware_update() writes the new decay weights back
+        # into these Memory objects, so retrieval below scores against the
+        # post-activation weights exactly as it did when it re-read the DB.
+        turn_memories = memory_store.list_active_memories()
+        turn_sims = similarity_map(query_embedding, turn_memories)
+
         activation_report = context_aware_update(
             query_embedding,
+            memories=turn_memories,
             exclude_mild_ids=(
                 frozenset(self._mild_ids)
                 if config.MILD_ONCE_PER_SESSION
                 else frozenset()
             ),
+            sims=turn_sims,
         )
         if config.MILD_ONCE_PER_SESSION:
             self._mild_ids.update(activation_report.mild_ids)
 
         details = retrieve_memories_detailed(
             query_embedding,
+            memories=turn_memories,
             top_k=top_k,
             query_text=text,
+            sims=turn_sims,
         )
         retrieved = [(detail.memory, detail.score) for detail in details]
         context = build_constitutional_memory_context(
@@ -299,6 +414,7 @@ class EngramTideSession:
             max_tokens=max_context_tokens,
             debug=debug,
             surfaced=list(self.surfaced_memories),
+            exclude_ids=frozenset(exclude_ids),
         )
         prepared = PreparedTurn(
             turn_id=resolved_turn_id,
@@ -314,6 +430,10 @@ class EngramTideSession:
         if record_user_message:
             self.add_message("user", text)
         return prepared
+
+    def get_prepared(self, turn_id: str) -> PreparedTurn | None:
+        """Return a previously prepared turn, or None."""
+        return self._prepared.get(turn_id)
 
     def acknowledge_used(
         self,
@@ -385,9 +505,11 @@ class EngramTideSession:
         ordered = sorted(memory_ids)
         if enabled:
             memory_store.mark_accessed(ordered)
-        logged_source = source if enabled else f"{source}_ablated"
-        for memory_id in ordered:
-            memory_store.log_access_event(memory_id, logged_source)
+        if config.ACCESS_LOG_ENABLED:
+            logged_source = source if enabled else f"{source}_ablated"
+            memory_store.log_access_events_batch(
+                [(memory_id, logged_source) for memory_id in ordered]
+            )
 
     def _ensure_open(self) -> None:
         if self._closed:

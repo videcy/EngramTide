@@ -4,4 +4,6 @@ numpy>=1.24.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+# 关键词通道的二级降级路径。首选后端是 SQLite 内置的 FTS5（零依赖），
+# 只有 FTS5 不可用、或查询项短到 trigram 索引查不了时才会用到 rapidfuzz。
 rapidfuzz>=3.0.0

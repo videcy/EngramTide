@@ -673,10 +673,14 @@ class TestActivationBoundaries:
 
     @staticmethod
     def _plant_sims(monkeypatch):
-        """让 cosine_similarity 返回记忆 embedding 的首元素（相似度精确可控）。"""
+        """让相似度等于记忆 embedding 的首元素（相似度精确可控）。
+
+        P1 之后相似度不再逐条算 cosine_similarity，而是由 core.vector_index 的
+        矩阵乘一次性给出，所以打桩点跟着换到 similarity_map。
+        """
         monkeypatch.setattr(
-            "utils.similarity.cosine_similarity",
-            lambda _q, emb: float(emb[0]),
+            "core.vector_index.similarity_map",
+            lambda _q, mems: {m.memory_id: float(m.embedding[0]) for m in mems},
         )
 
     def test_sim_exactly_high_is_mild_only(self, monkeypatch):

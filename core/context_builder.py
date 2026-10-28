@@ -44,6 +44,7 @@ def build_constitutional_memory_context(
     max_tokens: int = MAX_CONTEXT_TOKENS,
     debug: bool = False,
     surfaced: list[Memory] | None = None,
+    exclude_ids: frozenset[str] | set[str] | None = None,
 ) -> ConstitutionalMemoryContext:
     """
     将检索结果 + 浮现记忆合并，按类型分组，生成 Constitutional AI 上下文。
@@ -53,10 +54,17 @@ def build_constitutional_memory_context(
         max_tokens: 记忆上下文的总 token 预算（共享，非每桶独立）。
         debug: 是否在内容中包含分数信息。
         surfaced: Phase 2 浮现记忆列表（可选）。与检索合并，浮现优先。
+        exclude_ids: 不参与组装的记忆 ID（hook 会话内已注入过的）。在预算截断
+            之前排除，不占预算，也不计入 dropped_count。
 
     Returns:
         ConstitutionalMemoryContext: 四个动态片段。
     """
+    if exclude_ids:
+        retrieved = [(m, sc) for m, sc in retrieved if m.memory_id not in exclude_ids]
+        if surfaced:
+            surfaced = [m for m in surfaced if m.memory_id not in exclude_ids]
+
     # 合并检索 + 浮现（浮现优先，按 memory_id 去重）
     merged_scores: dict[str, float] = {}
     surfaced_by_id: dict[str, Memory] = {}

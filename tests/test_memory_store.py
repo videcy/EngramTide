@@ -363,18 +363,34 @@ def test_init_db_creates_meta_table():
     assert len(rows) == 1
 
 
-def test_init_db_creates_new_indexes():
-    """init_db 后三条新索引存在。"""
-    import sqlite3
+def test_init_db_keeps_only_the_index_that_is_actually_used():
+    """
+    P1：唯一的热查询是 `WHERE superseded_by IS NULL ORDER BY created_at DESC`。
 
+    原先那四条索引对它一条都用不上（仍是全表扫 + 排序），只在写入时增加 B 树
+    维护成本，因此全部删除，换成同时覆盖过滤条件与排序键的部分索引。
+    """
     from core.memory_store import _get_conn
 
     conn = _get_conn()
-    indexes = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_memories_%';"
+    index_names = {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index';"
+        ).fetchall()
+    }
+    assert "idx_active_created" in index_names
+    for legacy in (
+        "idx_memories_type",
+        "idx_memories_decay",
+        "idx_memories_created",
+        "idx_memories_unresolved",
+    ):
+        assert legacy not in index_names
+
+    # 部分索引确实被查询计划用上（不是建了个摆设）
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT memory_id FROM memories "
+        "WHERE superseded_by IS NULL ORDER BY created_at DESC;"
     ).fetchall()
-    index_names = {r["name"] for r in indexes}
-    assert "idx_memories_type" in index_names
-    assert "idx_memories_decay" in index_names
-    assert "idx_memories_created" in index_names
-    assert "idx_memories_unresolved" in index_names
+    assert any("idx_active_created" in str(tuple(row)) for row in plan)

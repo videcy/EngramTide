@@ -15,12 +15,12 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+import config
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -28,7 +28,6 @@ from config import (
     DEHYDRATE_MAX_ITEMS,
     MAX_TOPIC_SEGMENTS,
     MIN_SEGMENT_MESSAGES,
-    PROMPTS_DIR,
     REQUEST_TIMEOUT_SECONDS,
     TOPIC_SPLIT_ENABLED,
 )
@@ -40,9 +39,6 @@ logger = logging.getLogger(__name__)
 # 允许的记忆类型
 _ALLOWED_TYPES = {"semantic", "episodic", "emotional", "procedural"}
 
-# 加载 prompt 模板
-_DEHYDRATE_PROMPT_PATH: Path = PROMPTS_DIR / "dehydrate.txt"
-_TOPIC_SPLIT_PROMPT_PATH: Path = PROMPTS_DIR / "topic_split.txt"
 
 
 # ── 数据结构 ──────────────────────────────────────────────
@@ -56,6 +52,9 @@ class SplitReport:
     segments: int       # 分割段数（回退时为 1）
     fell_back: bool     # 是否回退到整段脱水
     reason: str = ""    # 回退原因（LLM 失败 / JSON 非法 / 索引越界…）
+    # 脱水失败段在输入消息里的下标区间 [start, end]（闭区间）。
+    # 调用方据此只把成功段对应的原文标记为已处理。
+    failed_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -78,8 +77,8 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 
 
 def _load_prompt(filename: str) -> str:
-    """加载 prompt 文件。"""
-    path = PROMPTS_DIR / filename
+    """加载 prompt 文件（PROMPTS_OVERRIDE_DIR 优先）。"""
+    path = config.prompt_path(filename)
     if path.exists():
         return path.read_text(encoding="utf-8")
     return ""
@@ -260,7 +259,7 @@ async def split_conversation(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1024,
+        "max_tokens": config.TOPIC_SPLIT_MAX_TOKENS,
     }
 
     try:
@@ -362,7 +361,7 @@ async def _dehydrate_segment(
             {"role": "user", "content": f"请提取以下对话中的记忆：\n\n{conversation_text}"},
         ],
         "temperature": 0.3,
-        "max_tokens": 2048,
+        "max_tokens": config.DEHYDRATE_MAX_TOKENS,
     }
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -375,7 +374,15 @@ async def _dehydrate_segment(
                 response=response,
             )
         data = response.json()
-        raw_output = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        raw_output = choice["message"]["content"] or ""
+
+    if choice.get("finish_reason") == "length":
+        logger.warning(
+            "脱水输出被截断（finish_reason=length，DEHYDRATE_MAX_TOKENS=%d）；"
+            "推理型模型的思考 token 也计入上限，可调大该值",
+            config.DEHYDRATE_MAX_TOKENS,
+        )
 
     raw_items = _extract_json_array(raw_output)
     if not raw_items:
@@ -442,12 +449,16 @@ async def dehydrate_conversation(
     all_memories: list[Memory] = []
     failed_segments = 0
     last_error: Exception | None = None
+    offset = 0  # 段是输入的连续切片（尾部合并后也是），累加长度即得下标
     for i, seg in enumerate(segments):
+        seg_start = offset
+        offset += len(seg)
         try:
             seg_memories = await _dehydrate_segment(seg, source_conv_id)
         except Exception as e:
             failed_segments += 1
             last_error = e
+            split_report.failed_ranges.append((seg_start, offset - 1))
             logger.warning(
                 "段 %d/%d 脱水失败: %s，跳过该段（其余段不受影响）",
                 i + 1, len(segments), e,

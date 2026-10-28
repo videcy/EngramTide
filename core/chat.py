@@ -9,17 +9,16 @@ Phase 1 MVP — 聊天 LLM 客户端。
 """
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+import config
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_CHAT_MODEL,
     MAX_HISTORY_MESSAGES,
-    PROMPTS_DIR,
     REQUEST_TIMEOUT_SECONDS,
 )
 from core.context_builder import ConstitutionalMemoryContext
@@ -35,7 +34,6 @@ _PROHIBITED_MEMORY_PHRASES = (
 )
 
 # 加载交互宪法模板（启动时一次性读取）
-_CONSTITUTION_PATH: Path = PROMPTS_DIR / "system_constitution.txt"
 _SYSTEM_TEMPLATE: str = ""
 
 
@@ -43,8 +41,9 @@ def _load_system_template() -> str:
     """加载交互宪法模板。"""
     global _SYSTEM_TEMPLATE
     if not _SYSTEM_TEMPLATE:
-        if _CONSTITUTION_PATH.exists():
-            _SYSTEM_TEMPLATE = _CONSTITUTION_PATH.read_text(encoding="utf-8")
+        constitution_path = config.prompt_path("system_constitution.txt")
+        if constitution_path.exists():
+            _SYSTEM_TEMPLATE = constitution_path.read_text(encoding="utf-8")
         else:
             logger.warning("找不到 system_constitution.txt，使用内置最小模板")
             _SYSTEM_TEMPLATE = (
@@ -117,7 +116,7 @@ async def generate_response(
         "model": DEEPSEEK_CHAT_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 2048,
+        "max_tokens": config.CHAT_MAX_TOKENS,
     }
 
     try:

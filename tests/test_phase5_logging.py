@@ -45,7 +45,17 @@ def _make_mem(
 
 @pytest.fixture(autouse=True)
 def setup_db(monkeypatch, tmp_path):
-    """独立临时数据库。"""
+    """独立临时数据库 + 显式打开埋点。
+
+    P0 之后 DECAY_LOG_ENABLED / ACCESS_LOG_ENABLED 生产默认关闭（逐行 commit 会
+    阻塞会话启动，且 decay_events 行数会远超 memories 本身）。本文件测的正是
+    埋点本身，所以在 fixture 里显式打开。
+    """
+    import config
+
+    monkeypatch.setattr(config, "DECAY_LOG_ENABLED", True)
+    monkeypatch.setattr(config, "ACCESS_LOG_ENABLED", True)
+
     db_file = tmp_path / "test_phase5_logging.db"
     monkeypatch.setattr("core.memory_store.DB_PATH", db_file)
     import core.memory_store as ms

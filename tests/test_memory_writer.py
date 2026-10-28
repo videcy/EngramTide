@@ -14,6 +14,7 @@ from core.memory_store import (
     insert_memory,
     list_active_memories,
 )
+from config import EPISODIC_REINFORCE_BOOST
 from core.memory_writer import write_memories, WriteReport
 
 
@@ -77,18 +78,52 @@ class TestEpisodicWrite:
         assert active[0].content == "昨天吃了火锅"
 
     @pytest.mark.asyncio
-    async def test_episodic_no_dedup_on_duplicate(self):
-        """episodic 不做去重，同样内容也会插入两次。"""
+    async def test_episodic_near_duplicate_reinforces(self):
+        """P4-①：近重复 episodic 强化已有记忆，不新增条目。"""
         emb = _fake_embed("事件")
-        m1 = _make_mem("episodic", "事件 A", embedding=emb)
+        m1 = _make_mem("episodic", "事件 A", embedding=emb, decay_weight=0.5)
         m2 = _make_mem("episodic", "事件 A", embedding=emb)
 
         await write_memories([m1])
         report = await write_memories([m2])
-        assert report.inserted == 1
+        assert report.inserted == 0
+        assert report.reinforced == 1
 
         active = list_active_memories()
-        assert len(active) == 2
+        assert len(active) == 1
+        # 强化 = 提权重 + 计访问
+        assert active[0].decay_weight == pytest.approx(0.5 + EPISODIC_REINFORCE_BOOST)
+        assert active[0].access_count == 1
+
+    @pytest.mark.asyncio
+    async def test_episodic_distinct_events_both_inserted(self):
+        """相似度低于阈值的两件事各自成条——门槛只拦真重复。"""
+        m1 = _make_mem("episodic", "事件 A", embedding=_fake_embed("事件 A"))
+        m2 = _make_mem("episodic", "事件 B", embedding=_fake_embed("完全不同的另一件事"))
+
+        await write_memories([m1])
+        report = await write_memories([m2])
+        assert report.inserted == 1
+        assert report.reinforced == 0
+        assert len(list_active_memories()) == 2
+
+    @pytest.mark.asyncio
+    async def test_episodic_dedup_can_be_disabled(self, monkeypatch):
+        """EPISODIC_DEDUP_ENABLED=false → 回到无条件直写（Phase 4 等价）。"""
+        import config
+
+        monkeypatch.setattr(config, "EPISODIC_DEDUP_ENABLED", False)
+        emb = _fake_embed("事件")
+        await write_memories([_make_mem("episodic", "事件 A", embedding=emb)])
+        report = await write_memories([_make_mem("episodic", "事件 A", embedding=emb)])
+        assert report.inserted == 1
+        assert len(list_active_memories()) == 2
+
+    @pytest.mark.asyncio
+    async def test_episodic_without_embedding_inserts(self):
+        """无 embedding 无法比相似度 → 直写，不因此丢数据。"""
+        report = await write_memories([_make_mem("episodic", "无向量事件")])
+        assert report.inserted == 1
 
 
 # ── Semantic：覆盖检测 ─────────────────────────────────────
@@ -256,16 +291,17 @@ class TestWriteErrorHandling:
     @pytest.mark.asyncio
     async def test_partial_failure_does_not_block_others(self):
         """单条记忆写入失败 → 记录 failed，其余正常。"""
-        emb = _fake_embed("正常")
-        good = _make_mem("episodic", "正常记忆", embedding=emb)
+        good = _make_mem("episodic", "正常记忆", embedding=_fake_embed("正常"))
         dup_id = str(uuid.uuid4())
 
-        # 先写入一条记忆占据该 ID
+        # 先写入一条记忆占据该 ID。
+        # 三条记忆的向量两两都不相似——否则会先命中 P4-① 的近重复强化，
+        # 走不到 insert，也就触发不了这里要测的主键冲突。
         existing = Memory(
             memory_id=dup_id,
             type="episodic",
             content="先占据",
-            embedding=emb,
+            embedding=_fake_embed("先占据"),
         )
         insert_memory(existing)
 
@@ -274,7 +310,7 @@ class TestWriteErrorHandling:
             memory_id=dup_id,  # 重复 ID → 触发 PRIMARY KEY 冲突
             type="episodic",
             content="重复ID记忆",
-            embedding=emb,
+            embedding=_fake_embed("重复ID记忆"),
         )
 
         report = await write_memories([bad, good])
