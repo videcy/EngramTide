@@ -1059,3 +1059,59 @@ class TestMildOncePerSession:
         assert report.capped == 0
         assert len(activations) == 1
         assert activations[0][0] == other.memory_id
+
+
+# ── 挂起冲突浮现（R3） ────────────────────────────────────
+
+
+class TestConflictSurfacing:
+    def _pair(self, n, decay=1.0):
+        from core.memory_store import insert_link
+        a = _make_mem("semantic", f"旧{n}", decay_weight=decay)
+        b = _make_mem("semantic", f"新{n}", decay_weight=decay)
+        insert_memory(a)
+        insert_memory(b)
+        insert_link(b.memory_id, a.memory_id, "contradict", judged_by="rule",
+                    status="pending", now=datetime(2026, 1, n, tzinfo=timezone.utc))
+        return a, b
+
+    def test_pending_pair_surfaces(self):
+        a, b = self._pair(1)
+        other = _make_mem("semantic", "无关")
+        insert_memory(other)
+        ids = {m.memory_id for m in get_surfaced_memories(list_active_memories())}
+        assert {a.memory_id, b.memory_id} <= ids
+        assert other.memory_id not in ids
+
+    def test_surface_max_keeps_newest_pairs(self, monkeypatch):
+        monkeypatch.setattr("config.CONFLICT_SURFACE_MAX", 1)
+        a1, b1 = self._pair(1)
+        a2, b2 = self._pair(2)
+        ids = {m.memory_id for m in get_surfaced_memories(list_active_memories())}
+        assert {a2.memory_id, b2.memory_id} <= ids
+        assert not ({a1.memory_id, b1.memory_id} & ids)
+
+    def test_low_decay_not_surfaced(self):
+        a, b = self._pair(1, decay=0.1)
+        assert get_surfaced_memories(list_active_memories()) == []
+
+    def test_resolved_link_does_not_surface(self):
+        from core.memory_store import list_pending_links, update_link_status
+        a, b = self._pair(1)
+        update_link_status(list_pending_links()[0].id, "resolved")
+        assert get_surfaced_memories(list_active_memories()) == []
+
+    def test_switch_off_unchanged(self, monkeypatch):
+        monkeypatch.setattr("config.CONFLICT_DETECT_ENABLED", False)
+        self._pair(1)
+        assert get_surfaced_memories(list_active_memories()) == []
+
+    def test_single_query(self, monkeypatch):
+        import core.memory_store as ms
+        calls = []
+        orig = ms.list_pending_links
+        monkeypatch.setattr(ms, "list_pending_links", lambda *a, **k: calls.append(1) or orig(*a, **k))
+        self._pair(1)
+        self._pair(2)
+        get_surfaced_memories(list_active_memories())
+        assert len(calls) == 1

@@ -257,6 +257,8 @@ def get_surfaced_memories(
       R2 emotional             → arousal > SURFACE_AROUSAL_THRESHOLD
                                  且 decay_weight > SURFACE_EMOTIONAL_MIN_DECAY
       R3 unresolved            → decay_weight > SURFACE_UNRESOLVED_MIN_DECAY
+                                 （有 pending 冲突关系的记忆视同 unresolved，
+                                  冲突对数受 CONFLICT_SURFACE_MAX 限制）
       R4 episodic 近期事件     → days_between(created_at, now) <= SURFACE_RECENT_DAYS
                                  且 decay_weight > SURFACE_EPISODIC_MIN_DECAY
 
@@ -271,6 +273,18 @@ def get_surfaced_memories(
       - embedding 是否为空不影响浮现（浮现是元数据驱动的）。
     """
     now = now or utc_now()
+
+    # 挂起冲突：只取最新 CONFLICT_SURFACE_MAX 对涉及的记忆，视同 unresolved（一次查询）
+    conflict_ids: set[str] = set()
+    if config.CONFLICT_DETECT_ENABLED and config.CONFLICT_SURFACE_MAX > 0:
+        try:
+            from core.memory_store import list_pending_links
+
+            for link in list_pending_links(limit=config.CONFLICT_SURFACE_MAX):
+                conflict_ids.add(link.src_id)
+                conflict_ids.add(link.dst_id)
+        except Exception as e:
+            logger.warning("读取挂起冲突失败，跳过冲突浮现: %s", e)
 
     r1: list[Memory] = []  # procedural
     r2: list[Memory] = []  # high-arousal emotional
@@ -297,7 +311,7 @@ def get_surfaced_memories(
             continue
 
         # R3: unresolved
-        if mem.unresolved:
+        if mem.unresolved or mem.memory_id in conflict_ids:
             if mem.decay_weight > SURFACE_UNRESOLVED_MIN_DECAY:
                 r3.append(mem)
             continue

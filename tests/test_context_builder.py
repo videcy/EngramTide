@@ -5,12 +5,26 @@
 import uuid
 
 import numpy as np
+import pytest
 
 from core.context_builder import (
     ConstitutionalMemoryContext,
     build_constitutional_memory_context,
 )
-from core.memory_store import Memory
+from core.memory_store import Memory, close_db, init_db, insert_link, insert_memories
+from utils.token_counter import estimate_tokens
+
+
+@pytest.fixture(autouse=True)
+def setup_db(monkeypatch, tmp_path):
+    """组装器会查挂起冲突，用独立临时库隔离。"""
+    monkeypatch.setattr("core.memory_store.DB_PATH", tmp_path / "ctx.db")
+    import core.memory_store as ms
+
+    ms._connection = None
+    init_db()
+    yield
+    close_db()
 
 
 def _make_result(
@@ -306,3 +320,71 @@ def test_single_over_budget_item_dropped_not_included():
     # 预算未被透支成负值：处理顺序更靠后的 emotional 桶仍能收录短条目
     assert small[0].memory_id in ctx.included_memory_ids
     assert ctx.dropped_count == 1
+
+
+# ── 挂起冲突标注 ──────────────────────────────────────────
+
+
+def _pending_pair(old_at="2026-01-01 00:00:00", new_at="2026-06-01 00:00:00"):
+    old = Memory(memory_id="old1", type="semantic", content="用户住在北京",
+                 embedding=np.array([1.0], dtype=np.float32), created_at=old_at)
+    new = Memory(memory_id="new1", type="semantic", content="用户住在上海",
+                 embedding=np.array([1.0], dtype=np.float32), created_at=new_at)
+    insert_memories([old, new])
+    insert_link("new1", "old1", "contradict", judged_by="rule", status="pending")
+    return old, new
+
+
+def test_conflict_note_points_to_older_record():
+    old, new = _pending_pair()
+    ctx = build_constitutional_memory_context([(new, 0.9)])
+    assert "- 用户住在上海（与较早的记录“用户住在北京”不一致，尚未确认；话题相关时可向用户确认）" in ctx.semantic_memories
+
+
+def test_conflict_note_points_to_newer_record():
+    old, new = _pending_pair()
+    ctx = build_constitutional_memory_context([(old, 0.9)])
+    assert "与较新的记录“用户住在上海”不一致" in ctx.semantic_memories
+
+
+def test_conflict_note_on_both_when_both_included():
+    old, new = _pending_pair()
+    ctx = build_constitutional_memory_context([(old, 0.9), (new, 0.8)])
+    assert ctx.semantic_memories.count("不一致，尚未确认") == 2
+
+
+def test_conflict_note_counts_toward_budget():
+    old, new = _pending_pair()
+    plain = estimate_tokens("- 用户住在上海")
+    ctx = build_constitutional_memory_context([(new, 0.9)], max_tokens=1000)
+    assert ctx.est_tokens > plain
+    assert ctx.est_tokens == estimate_tokens(ctx.semantic_memories)
+    # 预算只够不带标注的原行：退回原行，不透支
+    ctx = build_constitutional_memory_context([(new, 0.9)], max_tokens=plain)
+    assert ctx.semantic_memories == "- 用户住在上海"
+    assert ctx.est_tokens <= plain
+
+
+def test_conflict_note_skipped_when_counterpart_missing():
+    solo = Memory(memory_id="solo", type="semantic", content="用户养猫",
+                  embedding=np.array([1.0], dtype=np.float32))
+    insert_memories([solo])
+    insert_link("solo", "ghost", "contradict", judged_by="rule", status="pending")
+    ctx = build_constitutional_memory_context([(solo, 0.9)])
+    assert ctx.semantic_memories == "- 用户养猫"
+
+
+def test_conflict_note_resolved_link_ignored_and_switch_off(monkeypatch):
+    old, new = _pending_pair()
+    monkeypatch.setattr("config.CONFLICT_DETECT_ENABLED", False)
+    ctx = build_constitutional_memory_context([(new, 0.9)])
+    assert ctx.semantic_memories == "- 用户住在上海"
+
+
+def test_conflict_note_once_with_exclude_ids():
+    """已注入过的记忆被排除，标注随之不再出现。"""
+    old, new = _pending_pair()
+    ctx = build_constitutional_memory_context(
+        [(new, 0.9)], exclude_ids={"new1"}
+    )
+    assert ctx.semantic_memories == "无"

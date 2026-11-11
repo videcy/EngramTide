@@ -11,8 +11,10 @@ Phase 4 — Constitutional AI 上下文组装器（Token 预算版）。
 import logging
 from dataclasses import dataclass, field
 
+import config
 from core.memory_store import Memory
 from config import MAX_CONTEXT_TOKENS
+from utils.time_utils import parse_db_timestamp
 from utils.token_counter import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ def build_constitutional_memory_context(
     debug: bool = False,
     surfaced: list[Memory] | None = None,
     exclude_ids: frozenset[str] | set[str] | None = None,
+    pending_links: list | None = None,
 ) -> ConstitutionalMemoryContext:
     """
     将检索结果 + 浮现记忆合并，按类型分组，生成 Constitutional AI 上下文。
@@ -56,6 +59,8 @@ def build_constitutional_memory_context(
         surfaced: Phase 2 浮现记忆列表（可选）。与检索合并，浮现优先。
         exclude_ids: 不参与组装的记忆 ID（hook 会话内已注入过的）。在预算截断
             之前排除，不占预算，也不计入 dropped_count。
+        pending_links: 挂起的冲突关系（MemoryLink 列表）。None 时内部查询一次；
+            CONFLICT_DETECT_ENABLED=False 时不查、不加标注。
 
     Returns:
         ConstitutionalMemoryContext: 四个动态片段。
@@ -104,22 +109,27 @@ def build_constitutional_memory_context(
 
     context = ConstitutionalMemoryContext()
 
+    # 挂起冲突标注（一次查询；只对本次入桶的记忆生成）
+    notes = _build_conflict_notes(
+        [m for b in buckets.values() for m, _ in b], pending_links
+    )
+
     # 共享 token 预算（用可变列表传递）
     budget = [max_tokens]
 
     # 处理顺序：procedural → semantic → episodic → emotional
     # procedural 在预算内永远最先收录（浮现 R1 保底）
     proc_text, proc_ids, proc_tokens = _format_bucket_with_ids(
-        buckets["procedural"], budget, debug
+        buckets["procedural"], budget, debug, notes
     )
     sem_text, sem_ids, sem_tokens = _format_bucket_with_ids(
-        buckets["semantic"], budget, debug
+        buckets["semantic"], budget, debug, notes
     )
     epi_text, epi_ids, epi_tokens = _format_bucket_with_ids(
-        buckets["episodic"], budget, debug
+        buckets["episodic"], budget, debug, notes
     )
     emo_text, emo_ids, emo_tokens = _format_bucket_with_ids(
-        buckets["emotional"], budget, debug
+        buckets["emotional"], budget, debug, notes
     )
 
     context.procedural_memories = proc_text
@@ -148,6 +158,7 @@ def _format_bucket_with_ids(
     items: list[tuple[Memory, float]],
     budget: list[int],  # [remaining_tokens]，可变，调用方共享
     debug: bool,
+    notes: dict[str, str] | None = None,
 ) -> tuple[str, list[str], int]:
     """
     将一个分类的记忆格式化为文本片段。
@@ -175,6 +186,13 @@ def _format_bucket_with_ids(
         else:
             line = f"- {mem.content}"
 
+        note = notes.get(mem.memory_id) if notes else None
+        if note:
+            # 标注计入预算；带标注放不下时退回不带标注的原行
+            with_note = line + note
+            if tokens_used + estimate_tokens(with_note) <= remaining:
+                line = with_note
+
         line_tokens = estimate_tokens(line)
 
         if tokens_used + line_tokens > remaining:
@@ -189,3 +207,62 @@ def _format_bucket_with_ids(
     budget[0] = remaining - tokens_used
     text = "\n".join(lines) if lines else "无"
     return (text, ids, tokens_used)
+
+
+_NOTE_SNIPPET_CHARS = 60
+
+
+def _build_conflict_notes(
+    mems: list[Memory],
+    pending_links: list | None,
+) -> dict[str, str]:
+    """
+    为处于 pending 冲突关系中的记忆生成标注，返回 {memory_id: 标注文本}。
+
+    对方内容用 get_memory 取，取不到（已归档/删除）就不加标注。
+    一条记忆涉及多个 pending 关系时只取最新的一个（pending_links 已按新到旧）。
+    """
+    if not config.CONFLICT_DETECT_ENABLED or not mems:
+        return {}
+    if pending_links is None:
+        try:
+            from core.memory_store import list_pending_links
+
+            pending_links = list_pending_links()
+        except Exception as e:
+            logger.warning("读取挂起冲突失败，跳过冲突标注: %s", e)
+            return {}
+    if not pending_links:
+        return {}
+
+    from core.memory_store import get_memory
+
+    by_id = {m.memory_id: m for m in mems}
+    notes: dict[str, str] = {}
+    for link in pending_links:
+        for mid, other_id in ((link.src_id, link.dst_id), (link.dst_id, link.src_id)):
+            mem = by_id.get(mid)
+            if mem is None or mid in notes:
+                continue
+            try:
+                other = get_memory(other_id)
+            except Exception:
+                other = None
+            if other is None:
+                continue
+            text = other.content.strip().replace("\n", " ")
+            if len(text) > _NOTE_SNIPPET_CHARS:
+                text = text[:_NOTE_SNIPPET_CHARS] + "…"
+            word = "较新" if _is_newer(other, mem) else "较早"
+            notes[mid] = (
+                f"（与{word}的记录“{text}”不一致，尚未确认；话题相关时可向用户确认）"
+            )
+    return notes
+
+
+def _is_newer(a: Memory, b: Memory) -> bool:
+    """a 的 created_at 是否晚于 b；解析失败或相等视为否。"""
+    try:
+        return parse_db_timestamp(a.created_at) > parse_db_timestamp(b.created_at)
+    except (ValueError, TypeError):
+        return False

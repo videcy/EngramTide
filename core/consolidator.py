@@ -31,6 +31,7 @@ from core.memory_store import (
     insert_memory,
     list_active_memories,
     mark_superseded,
+    pending_link_memory_ids,
     set_meta,
 )
 from utils.similarity import cosine_similarity
@@ -45,7 +46,7 @@ class ConsolidationReport:
 
     candidates: int = 0   # 候选对数
     merged: int = 0       # 成功融合条数
-    skipped: int = 0      # LLM 失败/解析失败跳过的对数
+    skipped: int = 0      # LLM 失败/解析失败/判定矛盾(CONFLICT)跳过的对数
     capped: int = 0       # 因 CONSOLIDATE_MAX_PAIRS 截断的对数
 
 
@@ -83,9 +84,19 @@ def find_merge_candidates_capped(
     返回 (候选对列表, capped)。capped 只统计"若无上限本会入选"的对
     （已被贪心占用的对不计）。
     """
+    # 有挂起冲突关系的记忆不参与合并（矛盾要先由用户确认，不能融成一条）
+    pending_ids: set[str] = set()
+    if config.CONFLICT_DETECT_ENABLED:
+        try:
+            pending_ids = pending_link_memory_ids()
+        except Exception as e:
+            logger.warning("读取挂起冲突失败，合并候选不做排除: %s", e)
+
     # 收集合法候选
     candidates: list[Memory] = []
     for mem in memories:
+        if mem.memory_id in pending_ids:
+            continue
         if mem.type not in ("episodic", "emotional"):
             continue
         if mem.superseded_by is not None:
@@ -291,7 +302,8 @@ async def consolidate_memories(dry_run: bool = False) -> ConsolidationReport:
     for a, b, sim in pairs:
         # 1. LLM 融合
         merged_content = await _llm_merge_pair(a.content, b.content, a.type)
-        if merged_content is None:
+        if merged_content is None or merged_content.strip() == "CONFLICT":
+            # None：LLM 失败；CONFLICT：模型判定两条互相矛盾，不融合
             report.skipped += 1
             continue
 
