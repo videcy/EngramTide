@@ -265,12 +265,26 @@ async def apply_plan(
     *,
     now: datetime | None = None,
     unresolved_days: int = DEFAULT_UNRESOLVED_DAYS,
+    llm_judge: bool = False,
 ) -> dict:
-    """按计划写库。返回汇总；已导入的段跳过。"""
-    now = now or utc_now()
+    """按计划写库。返回汇总；已导入的段跳过。
+
+    llm_judge=False（默认）：导入期间关闭冲突的 LLM 判定，只走规则。
+    """
+    saved = config.CONFLICT_LLM_JUDGE_ENABLED
+    if not llm_judge:
+        config.CONFLICT_LLM_JUDGE_ENABLED = False
+    try:
+        return await _apply_entries(plan, now or utc_now(), unresolved_days)
+    finally:
+        config.CONFLICT_LLM_JUDGE_ENABLED = saved
+
+
+async def _apply_entries(plan: dict, now: datetime, unresolved_days: int) -> dict:
     memory_store.init_db()
     summary = {"entries": 0, "skipped": 0, "failed_entries": 0,
-               "inserted": 0, "superseded": 0, "reinforced": 0, "deduped": 0, "failed": 0}
+               "inserted": 0, "superseded": 0, "reinforced": 0, "deduped": 0, "failed": 0,
+               "updated": 0, "refined": 0, "conflicted": 0, "damped": 0}
 
     # 按时间顺序写：semantic 覆盖、emotional 强化都依赖「后来的事实更新」
     entries = sorted(plan["entries"], key=lambda e: (e["occurred_at"], e["source_id"]))
@@ -302,10 +316,12 @@ async def apply_plan(
                 source_conv_id=entry["source_id"],
                 unresolved=m["unresolved"] and recent,
                 tags=tags,
+                origin="import",
             ))
         report = await write_memories(memories)
-        for field in ("inserted", "superseded", "reinforced", "deduped", "failed"):
-            summary[field] += getattr(report, field)
+        for field in ("inserted", "superseded", "reinforced", "deduped", "failed",
+                      "updated", "refined", "conflicted", "damped"):
+            summary[field] += getattr(report, field, 0)
         memory_store.set_meta(key, now.strftime(_DB_TIME_FORMAT))
         summary["entries"] += 1
     return summary
@@ -320,7 +336,9 @@ async def cmd_apply(args: argparse.Namespace) -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    summary = await apply_plan(plan, unresolved_days=args.unresolved_days)
+    summary = await apply_plan(
+        plan, unresolved_days=args.unresolved_days, llm_judge=args.llm_judge
+    )
     memory_store.close_db()
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
@@ -344,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("plan")
     p_apply.add_argument("--unresolved-days", type=int, default=DEFAULT_UNRESOLVED_DAYS,
                          help="只有这么多天以内的段保留「未解决」标记")
+    p_apply.add_argument("--llm-judge", action="store_true",
+                         help="导入时启用冲突的 LLM 判定（默认只走规则）")
 
     args = parser.parse_args(argv)
     handler = cmd_plan if args.command == "plan" else cmd_apply

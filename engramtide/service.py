@@ -37,10 +37,10 @@ from utils.time_utils import utc_now
 logger = logging.getLogger(__name__)
 
 _SECTION_TITLES = (
-    ("procedural_memories", "## 偏好与规则"),
-    ("semantic_memories", "## 用户事实"),
-    ("episodic_memories", "## 近期经历"),
-    ("emotional_memories", "## 情感沉淀"),
+    ("procedural_memories", "## 我们的约定"),
+    ("semantic_memories", "## 关于你"),
+    ("episodic_memories", "## 最近"),
+    ("emotional_memories", "## 心里留下的"),
 )
 _EMPTY_SECTION = "无"
 
@@ -85,6 +85,18 @@ def render_context(
     if "\n" in cut:
         cut = cut[: cut.rindex("\n")]
     return template.format(session_id=safe_id, sections=cut)
+
+
+def _report_dict(report: Any) -> dict[str, Any]:
+    """WriteReport -> dict，冲突处理的新计数缺失时按 0 补齐。"""
+    data = asdict(report)
+    for key in ("updated", "refined", "conflicted", "damped"):
+        data[key] = getattr(report, key, 0)
+    return data
+
+
+_CONFLICT_RELATIONS = ("update", "contradict", "refine")
+_KEEP_CHOICES = ("new", "old", "both")
 
 
 @dataclass
@@ -296,7 +308,7 @@ class MemoryService:
             # 也不能出现「标记了但没写进去」
             write_report = await write_memories(memories)
             done = [r["seq"] for i, r in enumerate(rows) if i not in failed]
-            result["write_report"] = asdict(write_report)
+            result["write_report"] = _report_dict(write_report)
             result["marked_messages"] = memory_store.mark_turns_dehydrated(done)
             result["pending_messages"] = len(rows) - len(done)
             return result
@@ -339,7 +351,7 @@ class MemoryService:
             tags=tags,
             source_conv_id=session_id,
         )
-        return asdict(report)
+        return _report_dict(report)
 
     async def search_memories(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         matches = await self.engine.search_memories(query, limit=limit)
@@ -386,6 +398,102 @@ class MemoryService:
 
     def restore_archived(self, memory_ids: Iterable[str]) -> dict[str, int]:
         return {"restored": self.engine.restore_archived(memory_ids)}
+
+    # ── 冲突处理 ─────────────────────────────────────────
+
+    @staticmethod
+    def list_conflicts(status: str = "pending", limit: int = 20) -> list[dict[str, Any]]:
+        """列出冲突关系及两端记忆（纯读）。热表取不到的记忆去归档表找。"""
+        if limit < 0:
+            raise ValueError("limit must be >= 0")
+        if status == "pending":
+            links = memory_store.list_pending_links(limit)
+        else:
+            links = [
+                l
+                for l in memory_store.links_for(MemoryService._all_link_memory_ids())
+                if l.status == status
+            ]
+            links.sort(key=lambda l: (l.created_at, l.id), reverse=True)
+            links = links[:limit]
+        archived: dict[str, Any] | None = None
+        out = []
+        for link in links:
+            ends = {}
+            for key, mid in (("new", link.src_id), ("old", link.dst_id)):
+                mem = memory_store.get_memory(mid)
+                in_archive = False
+                if mem is None:
+                    if archived is None:
+                        archived = {m.memory_id: m for m in memory_store.list_archived_memories()}
+                    mem = archived.get(mid)
+                    in_archive = mem is not None
+                ends[key] = {
+                    "id": mid,
+                    "content": mem.content if mem else None,
+                    "created_at": mem.created_at if mem else None,
+                    "archived": in_archive,
+                }
+            out.append(
+                {
+                    "link_id": link.id,
+                    "relation": link.relation,
+                    "subtype": link.subtype,
+                    "reason": link.reason,
+                    "similarity": link.similarity,
+                    "status": link.status,
+                    "created_at": link.created_at,
+                    "new": ends["new"],
+                    "old": ends["old"],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _all_link_memory_ids() -> list[str]:
+        conn = memory_store._get_conn()
+        rows = conn.execute("SELECT src_id, dst_id FROM memory_links").fetchall()
+        return list({x for r in rows for x in (r[0], r[1])})
+
+    @staticmethod
+    def resolve_conflict(link_id: int, keep: str) -> dict[str, Any]:
+        """处理一条挂起冲突：keep=new/old 让另一条覆盖并归档，both 两条都留。"""
+        if keep not in _KEEP_CHOICES:
+            return {"error": f"keep must be one of {', '.join(_KEEP_CHOICES)}"}
+        link = memory_store.get_link(link_id)
+        if link is None:
+            return {"error": f"link {link_id} not found"}
+        if link.status == "resolved":
+            return {"error": f"link {link_id} is already resolved"}
+        archived = 0
+        if keep != "both":
+            loser, winner = (
+                (link.dst_id, link.src_id) if keep == "new" else (link.src_id, link.dst_id)
+            )
+            if memory_store.get_memory(loser) is None or memory_store.get_memory(winner) is None:
+                return {"error": "one of the memories is no longer in active memory"}
+            archived = memory_store.supersede_and_archive([loser], winner)
+        memory_store.update_link_status(link_id, "resolved")
+        return {"link_id": link_id, "keep": keep, "archived": archived}
+
+    @staticmethod
+    def undo_supersede(memory_id: str) -> dict[str, Any]:
+        """恢复被冲突覆盖而归档的记忆，相关冲突关系改回 pending。"""
+        if memory_store.get_memory(memory_id) is not None:
+            return {"error": f"memory {memory_id} is not archived"}
+        if not any(m.memory_id == memory_id for m in memory_store.list_archived_memories()):
+            return {"error": f"memory {memory_id} not found in archive"}
+        links = [
+            l
+            for l in memory_store.links_for([memory_id])
+            if l.relation in _CONFLICT_RELATIONS
+        ]
+        if not links:
+            return {"error": f"memory {memory_id} was not superseded by a conflict"}
+        restored = memory_store.restore_archived([memory_id], clear_superseded=True)
+        for link in links:
+            memory_store.update_link_status(link.id, "pending")
+        return {"restored": restored, "links_reopened": [l.id for l in links]}
 
     def run_maintenance(self) -> dict[str, Any]:
         return asdict(self.engine.run_maintenance(force=True))

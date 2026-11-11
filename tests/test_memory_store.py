@@ -394,3 +394,189 @@ def test_init_db_keeps_only_the_index_that_is_actually_used():
         "WHERE superseded_by IS NULL ORDER BY created_at DESC;"
     ).fetchall()
     assert any("idx_active_created" in str(tuple(row)) for row in plan)
+
+
+# ── 冲突处理：origin / memory_links / 覆盖归档 ─────────────
+
+
+def _mk(content="用户住在北京", mtype="semantic", **kw):
+    mid = kw.pop("memory_id", str(uuid.uuid4()))
+    m = Memory(memory_id=mid, type=mtype, content=content, **kw)
+    insert_memory(m)
+    return mid
+
+
+def test_origin_roundtrip_insert_archive_restore():
+    import core.memory_store as ms
+
+    a = _mk(origin="remember")
+    b = str(uuid.uuid4())
+    insert_memories([Memory(memory_id=b, type="semantic", content="批量", origin="import")])
+    c = _mk("默认来源")
+    assert ms.get_memory(a).origin == "remember"
+    assert ms.get_memory(b).origin == "import"
+    assert ms.get_memory(c).origin == "dehydrate"
+
+    ms.archive_memories([a])
+    assert [m.origin for m in ms.list_archived_memories()] == ["remember"]
+    ms.restore_archived([a])
+    assert ms.get_memory(a).origin == "remember"
+
+
+def test_migrate_old_db_without_origin_and_links(monkeypatch, tmp_path):
+    import sqlite3
+
+    import core.memory_store as ms
+
+    close_db()
+    db_file = tmp_path / "old.db"
+    raw = sqlite3.connect(db_file)
+    raw.execute(
+        "CREATE TABLE memories (memory_id TEXT PRIMARY KEY, type TEXT NOT NULL, "
+        "content TEXT NOT NULL, valence REAL DEFAULT 0.0, arousal REAL DEFAULT 0.0, "
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+        "last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP, access_count INTEGER DEFAULT 0, "
+        "decay_weight REAL DEFAULT 1.0, embedding BLOB, source_conv_id TEXT, "
+        "unresolved BOOLEAN DEFAULT FALSE, tags TEXT DEFAULT '', superseded_by TEXT DEFAULT NULL)"
+    )
+    raw.execute(
+        "CREATE TABLE memories_archive (memory_id TEXT PRIMARY KEY, type TEXT NOT NULL, "
+        "content TEXT NOT NULL, valence REAL DEFAULT 0.0, arousal REAL DEFAULT 0.0, "
+        "created_at TIMESTAMP, last_accessed TIMESTAMP, access_count INTEGER DEFAULT 0, "
+        "decay_weight REAL DEFAULT 1.0, embedding BLOB, source_conv_id TEXT, "
+        "unresolved BOOLEAN DEFAULT FALSE, tags TEXT DEFAULT '', "
+        "superseded_by TEXT DEFAULT NULL, archived_at TEXT NOT NULL)"
+    )
+    raw.execute("INSERT INTO memories (memory_id, type, content) VALUES ('o1','semantic','旧库记忆')")
+    raw.execute(
+        "INSERT INTO memories_archive (memory_id, type, content, archived_at) "
+        "VALUES ('o2','episodic','旧归档','2026-01-01T00:00:00')"
+    )
+    raw.commit()
+    raw.close()
+
+    monkeypatch.setattr("core.memory_store.DB_PATH", db_file)
+    ms._connection = None
+    init_db()
+    assert ms.get_memory("o1").origin == "dehydrate"
+    assert ms.list_archived_memories()[0].origin == "dehydrate"
+    assert ms.list_pending_links() == []
+    init_db()  # 幂等
+
+
+def test_insert_get_update_link():
+    import core.memory_store as ms
+
+    lid = ms.insert_link(
+        "n1", "o1", "update", judged_by="rule", status="pending",
+        subtype="correction", similarity=0.9, reason="r",
+    )
+    link = ms.get_link(lid)
+    assert (link.src_id, link.dst_id, link.relation) == ("n1", "o1", "update")
+    assert (link.subtype, link.similarity, link.reason) == ("correction", 0.9, "r")
+    assert link.status == "pending" and link.resolved_at is None
+
+    assert ms.update_link_status(lid, "resolved") is True
+    assert ms.get_link(lid).resolved_at
+    assert ms.update_link_status(lid, "pending") is True
+    assert ms.get_link(lid).resolved_at is None
+    assert ms.update_link_status(9999, "resolved") is False
+    assert ms.get_link(9999) is None
+
+    rid = ms.insert_link("a", "b", "refine", judged_by="llm", status="resolved")
+    assert ms.get_link(rid).resolved_at is not None
+
+
+def test_list_pending_links_order_and_limit():
+    import core.memory_store as ms
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    l1 = ms.insert_link("a", "b", "update", judged_by="rule", status="pending", now=t0)
+    l2 = ms.insert_link("c", "d", "update", judged_by="rule", status="pending",
+                        now=t0 + timedelta(days=1))
+    l3 = ms.insert_link("e", "f", "update", judged_by="rule", status="pending", now=t0)
+    ms.insert_link("g", "h", "update", judged_by="rule", status="resolved", now=t0)
+    assert [x.id for x in ms.list_pending_links()] == [l2, l3, l1]
+    assert [x.id for x in ms.list_pending_links(limit=2)] == [l2, l3]
+
+
+def test_links_for_and_pending_ids():
+    import core.memory_store as ms
+
+    l1 = ms.insert_link("a", "b", "update", judged_by="rule", status="pending")
+    l2 = ms.insert_link("c", "a", "refine", judged_by="rule", status="resolved")
+    ms.insert_link("x", "y", "update", judged_by="rule", status="resolved")
+    assert [x.id for x in ms.links_for(["a"])] == [l1, l2]
+    assert [x.id for x in ms.links_for(["b", "zzz"])] == [l1]
+    assert ms.links_for([]) == []
+    assert ms.pending_link_memory_ids() == {"a", "b"}
+
+
+def test_delete_memories_cascades_links():
+    import core.memory_store as ms
+
+    a, b, c = _mk("甲"), _mk("乙"), _mk("丙")
+    ms.insert_link(a, b, "update", judged_by="rule", status="pending")
+    ms.insert_link(c, a, "refine", judged_by="rule", status="resolved")
+    keep = ms.insert_link(b, c, "update", judged_by="rule", status="pending")
+    ms.delete_memories([a])
+    assert [x.id for x in ms.links_for([a, b, c])] == [keep]
+
+
+def test_supersede_and_archive_then_restore_clear():
+    import core.memory_store as ms
+
+    old, new = _mk("用户住在北京"), _mk("用户搬到了上海")
+    assert ms.supersede_and_archive([old], new) == 1
+    assert ms.supersede_and_archive([], new) == 0
+    assert ms.get_memory(old) is None
+    assert old not in {m.memory_id for m in list_active_memories()}
+    arch = ms.list_archived_memories()
+    assert [m.memory_id for m in arch] == [old] and arch[0].superseded_by == new
+
+    assert ms.restore_archived([old], clear_superseded=True) == 1
+    m = ms.get_memory(old)
+    assert m.superseded_by is None
+    assert old in {x.memory_id for x in list_active_memories()}
+
+
+def test_restore_archived_default_keeps_superseded():
+    import core.memory_store as ms
+
+    old, new = _mk("甲"), _mk("乙")
+    ms.supersede_and_archive([old], new)
+    ms.restore_archived([old])
+    assert ms.get_memory(old).superseded_by == new
+
+
+def test_scale_decay_weight_clamps():
+    import core.memory_store as ms
+
+    mid = _mk(decay_weight=0.8)
+    ms.scale_decay_weight(mid, 0.5)
+    assert ms.get_memory(mid).decay_weight == pytest.approx(0.4)
+    ms.scale_decay_weight(mid, 10)
+    assert ms.get_memory(mid).decay_weight == 1.0
+    ms.scale_decay_weight(mid, -1)
+    assert ms.get_memory(mid).decay_weight == 0.0
+
+
+def test_clear_unresolved():
+    import core.memory_store as ms
+
+    mid = _mk(unresolved=True)
+    assert ms.get_memory(mid).unresolved is True
+    ms.clear_unresolved(mid)
+    assert ms.get_memory(mid).unresolved is False
+
+
+def test_memory_stats_link_fields():
+    import core.memory_store as ms
+
+    s = ms.memory_stats()
+    assert s["pending_conflicts"] == 0 and s["memory_links"] == 0
+    ms.insert_link("a", "b", "update", judged_by="rule", status="pending")
+    ms.insert_link("c", "d", "refine", judged_by="rule", status="resolved")
+    s = ms.memory_stats()
+    assert s["pending_conflicts"] == 1 and s["memory_links"] == 2

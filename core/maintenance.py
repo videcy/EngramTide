@@ -25,10 +25,14 @@ from core.memory_store import (
     get_meta,
     prune_dehydrated_turns,
     prune_event_logs,
+    list_pending_links,
     purge_superseded,
+    supersede_and_archive,
+    update_link_status,
+    get_memory,
     set_meta,
 )
-from utils.time_utils import utc_now
+from utils.time_utils import days_between, parse_db_timestamp, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ class MaintenanceReport:
     purged: int = 0          # 硬删除的 superseded 条数
     pruned_events: int = 0   # 清理的埋点事件行数
     pruned_turns: int = 0    # 清理的已脱水对话缓冲行数
+    expired_conflicts: int = 0  # 挂起过久被自动裁决的冲突关系数
 
 
 def _next_session_count() -> int:
@@ -56,6 +61,38 @@ def _next_session_count() -> int:
         count = 1
     set_meta(_SESSION_COUNTER_KEY, str(count))
     return count
+
+
+def expire_pending_conflicts(now: datetime | None = None) -> int:
+    """
+    挂起超过 CONFLICT_PENDING_EXPIRE_DAYS 天的冲突自动裁决：created_at 较新者胜出，
+    较旧者被覆盖并归档，关系标 resolved。任一条已不在热表（被归档/删除）时只标 resolved。
+    CONFLICT_PENDING_EXPIRE_DAYS < 0 关闭。返回处理的关系数。
+    """
+    days = config.CONFLICT_PENDING_EXPIRE_DAYS
+    if days < 0:
+        return 0
+    now = now or utc_now()
+    handled = 0
+    for link in list_pending_links():
+        try:
+            if days_between(parse_db_timestamp(link.created_at), now) < days:
+                continue
+        except ValueError:
+            continue
+        a, b = get_memory(link.src_id), get_memory(link.dst_id)
+        if a is not None and b is not None and a.superseded_by is None and b.superseded_by is None:
+            try:
+                ta, tb = parse_db_timestamp(a.created_at), parse_db_timestamp(b.created_at)
+            except ValueError:
+                ta = tb = None
+            if ta is not None and tb is not None:
+                # 同时间时以 src（新记忆）为准
+                newer, older = (b, a) if tb > ta else (a, b)
+                supersede_and_archive([older.memory_id], newer.memory_id)
+        update_link_status(link.id, "resolved", now=now)
+        handled += 1
+    return handled
 
 
 def run_maintenance(
@@ -89,6 +126,13 @@ def run_maintenance(
     except Exception as e:
         logger.warning("清理对话缓冲失败: %s", e)
 
+    # ①'' 挂起过久的冲突自动裁决（较新者胜出）
+    if config.CONFLICT_DETECT_ENABLED:
+        try:
+            report.expired_conflicts = expire_pending_conflicts(now=now)
+        except Exception as e:
+            logger.warning("处理过期挂起冲突失败: %s", e)
+
     if not config.ARCHIVE_ENABLED:
         set_meta(_LAST_RUN_KEY, now.isoformat())
         return report
@@ -109,10 +153,11 @@ def run_maintenance(
 
     set_meta(_LAST_RUN_KEY, now.isoformat())
 
-    if report.archived or report.purged or report.pruned_events or report.pruned_turns:
+    if report.archived or report.purged or report.pruned_events or report.pruned_turns or report.expired_conflicts:
         logger.info(
-            "记忆库维护: 归档 %d 条, 硬删 supersede %d 条, 清理埋点 %d 行, 清理对话缓冲 %d 行",
+            "记忆库维护: 归档 %d 条, 硬删 supersede %d 条, 清理埋点 %d 行, 清理对话缓冲 %d 行, 过期冲突裁决 %d 条",
             report.archived, report.purged, report.pruned_events, report.pruned_turns,
+            report.expired_conflicts,
         )
     return report
 

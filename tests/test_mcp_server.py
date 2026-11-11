@@ -26,11 +26,33 @@ async def test_mcp_exposes_write_and_admin_tools_only():
         "export_memories",
         "memory_stats",
         "search_archive",
+        "list_conflicts",
+        "resolve_conflict",
+        "undo_supersede",
     }
     assert mcp.settings.host == "127.0.0.1"
     assert mcp.settings.streamable_http_path == "/mcp"
     assert mcp.settings.stateless_http is True
     assert mcp.settings.transport_security.enable_dns_rebinding_protection is True
+
+
+@pytest.mark.asyncio
+async def test_conflict_tools_parameter_contract():
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    lc = tools["list_conflicts"].inputSchema
+    assert lc["properties"]["status"]["default"] == "pending"
+    assert lc["properties"]["limit"]["default"] == 20
+    assert not lc.get("required")
+
+    rc = tools["resolve_conflict"].inputSchema
+    assert set(rc["required"]) == {"link_id", "keep"}
+    assert rc["properties"]["keep"]["enum"] == ["new", "old", "both"]
+    assert "MODIFIES DATA" in tools["resolve_conflict"].description
+
+    us = tools["undo_supersede"].inputSchema
+    assert us["required"] == ["memory_id"]
+    assert "MODIFIES DATA" in tools["undo_supersede"].description
 
 
 def test_hook_routes_are_served_by_the_same_app():

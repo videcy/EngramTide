@@ -613,6 +613,59 @@ class TestMaintenanceScheduling:
         assert len(list_active_memories()) == 1
 
 
+class TestExpirePendingConflicts:
+    def _setup(self, old_at, new_at, link_at):
+        from core.memory_store import insert_link
+        old = _mem("semantic", "用户住在北京", _vec(1.0), created_at=old_at)
+        new = _mem("semantic", "用户住在上海", _vec(1.0), created_at=new_at)
+        insert_memories([old, new])
+        lid = insert_link(new.memory_id, old.memory_id, "contradict",
+                          judged_by="rule", status="pending", now=utc_now() - timedelta(days=40))
+        return old, new, lid
+
+    def test_newer_wins_and_older_archived(self):
+        from core.maintenance import run_maintenance
+        from core.memory_store import get_link
+        old, new, lid = self._setup("2026-01-01 00:00:00", "2026-06-01 00:00:00", None)
+        report = run_maintenance(force=True)
+        assert report.expired_conflicts == 1
+        assert [m.memory_id for m in list_active_memories()] == [new.memory_id]
+        assert get_link(lid).status == "resolved"
+
+    def test_src_older_loses_even_if_src(self):
+        from core.maintenance import run_maintenance
+        old, new, _ = self._setup("2026-06-01 00:00:00", "2026-01-01 00:00:00", None)
+        run_maintenance(force=True)
+        # new（src）created_at 更早，应被覆盖，old 保留
+        assert [m.memory_id for m in list_active_memories()] == [old.memory_id]
+
+    def test_not_expired_untouched(self, monkeypatch):
+        from core.maintenance import run_maintenance
+        from core.memory_store import get_link
+        monkeypatch.setattr(config, "CONFLICT_PENDING_EXPIRE_DAYS", 100)
+        _, _, lid = self._setup("2026-01-01 00:00:00", "2026-06-01 00:00:00", None)
+        assert run_maintenance(force=True).expired_conflicts == 0
+        assert get_link(lid).status == "pending"
+        assert len(list_active_memories()) == 2
+
+    def test_negative_disables(self, monkeypatch):
+        from core.maintenance import run_maintenance
+        monkeypatch.setattr(config, "CONFLICT_PENDING_EXPIRE_DAYS", -1)
+        self._setup("2026-01-01 00:00:00", "2026-06-01 00:00:00", None)
+        assert run_maintenance(force=True).expired_conflicts == 0
+        assert len(list_active_memories()) == 2
+
+    def test_already_archived_only_resolves_link(self):
+        from core.maintenance import run_maintenance
+        from core.memory_store import get_link
+        old, new, lid = self._setup("2026-01-01 00:00:00", "2026-06-01 00:00:00", None)
+        archive_memories([old.memory_id])
+        report = run_maintenance(force=True)
+        assert report.expired_conflicts == 1
+        assert get_link(lid).status == "resolved"
+        assert [m.memory_id for m in list_active_memories()] == [new.memory_id]
+
+
 class TestStats:
     def test_counts_and_net_growth(self):
         insert_memories([

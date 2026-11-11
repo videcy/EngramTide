@@ -12,7 +12,8 @@ P4-①：episodic 原先是四类里唯一无条件 insert 的类型——而它
 """
 
 import logging
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 
 import config
 from config import (
@@ -23,16 +24,30 @@ from config import (
     PROCEDURAL_DEDUP_THRESHOLD,
     SEMANTIC_OVERRIDE_THRESHOLD,
 )
+from core.conflict import (
+    Candidate,
+    Relation,
+    find_conflict_candidates,
+    judge_by_rules,
+    judge_relations,
+)
+from core.embedding import embed_text
 from core.memory_store import (
     Memory,
+    clear_unresolved,
+    get_memory,
+    insert_link,
     insert_memory,
     list_active_memories,
     log_access_event,
     mark_accessed,
     mark_superseded,
     reinforce_memory,
+    scale_decay_weight,
+    supersede_and_archive,
 )
 from utils.similarity import cosine_similarity
+from utils.time_utils import parse_db_timestamp, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +61,14 @@ class WriteReport:
     reinforced: int = 0   # 被强化的旧 emotional 条数
     deduped: int = 0      # 被去重拦截的 procedural 条数
     failed: int = 0       # 单条失败跳过条数
+    updated: int = 0      # 冲突判定：新记忆更新/更正了旧记忆（含 followup）
+    refined: int = 0      # 冲突判定：新记忆补充了旧记忆
+    conflicted: int = 0   # 冲突判定：挂起待确认的冲突对数
+    damped: int = 0       # emotional 态度反转，旧记忆被降权的条数
+
+
+# 最近一次 write_memories 的判定明细（每次调用开头清空），供 /debug conflicts
+LAST_JUDGMENTS: list[str] = []
 
 
 def _compute_similarity(
@@ -73,8 +96,12 @@ async def write_memories(new_memories: list[Memory]) -> WriteReport:
     因此要求 new_memories 中的记忆已携带 embedding。
     无 embedding 的记忆降级为直接 insert（episodic 策略）。
     """
+    LAST_JUDGMENTS.clear()
     if not new_memories:
         return WriteReport()
+
+    if config.CONFLICT_DETECT_ENABLED:
+        return await _write_with_conflict(new_memories)
 
     # 一次性加载所有 active 记忆作为候选池
     existing = list_active_memories()
@@ -244,3 +271,349 @@ def _handle_episodic(
 
     insert_memory(new_mem)
     report.inserted += 1
+
+
+# ── 冲突感知写入管线 ──────────────────────────────────────
+
+_VERBS = {
+    "duplicate": "重复",
+    "refine": "补充",
+    "update": "覆盖",
+    "contradict": "挂起",
+    "unrelated": "无关",
+}
+
+
+def _clip(text: str, n: int = 30) -> str:
+    text = (text or "").replace("\n", " ")
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def _log_judgment(
+    rel: Relation,
+    new_mem: Memory,
+    old: Memory,
+    *,
+    verb: str | None = None,
+    tag: str | None = None,
+    note: str | None = None,
+) -> None:
+    """追加一行判定明细：[relation|sim=0.71|llm] 新 → 覆盖：旧（理由）。"""
+    tag = tag or rel.relation
+    verb = verb or _VERBS.get(rel.relation, rel.relation)
+    arrow = "⇄" if verb == "挂起" else "→"
+    reason = note if note is not None else rel.reason
+    tail = f"（{reason}）" if reason else ""
+    LAST_JUDGMENTS.append(
+        f"[{tag}|sim={rel.similarity:.2f}|{rel.judged_by}] "
+        f"{_clip(new_mem.content)} {arrow} {verb}：{_clip(old.content)}{tail}"
+    )
+
+
+def _created_at(mem: Memory):
+    """created_at 转 aware datetime；空串或无法解析视为当前 UTC 时间。"""
+    if not mem.created_at:
+        return utc_now()
+    try:
+        return parse_db_timestamp(mem.created_at)
+    except ValueError:
+        return utc_now()
+
+
+def _guard_failure(new_mem: Memory, old: Memory, *, skip_access: bool = False) -> str | None:
+    """覆盖旧记忆前的三条守卫；全部通过返回 None，否则返回失败原因。"""
+    if _created_at(new_mem) < _created_at(old):
+        return "新记忆的时间早于旧记忆"
+    if old.origin == "remember" and new_mem.origin != "remember":
+        return "旧记忆来自显式 remember，脱水/导入不能自动覆盖"
+    if not skip_access and old.access_count >= config.CONFLICT_PROTECT_ACCESS:
+        return f"旧记忆 access_count={old.access_count}，受保护"
+    return None
+
+
+def _link(new_id: str, old_id: str, rel: Relation, relation: str, status: str,
+          subtype: str | None) -> None:
+    insert_link(
+        new_id,
+        old_id,
+        relation,
+        judged_by=rel.judged_by,
+        status=status,
+        subtype=subtype,
+        similarity=rel.similarity,
+        reason=rel.reason,
+    )
+
+
+class _BatchState:
+    """一次批量写入内的状态：原新记忆 id → 实际入库 id（被吸收的不在内）。"""
+
+    def __init__(self, batch_ids: set[str]):
+        self.batch_ids = batch_ids
+        self.inserted: dict[str, str] = {}
+
+    def resolve_old(self, old_id: str) -> Memory | None:
+        """把关系里的 old 解析成库里当前仍有效的记忆；不存在/已被覆盖返回 None。"""
+        if old_id in self.batch_ids:
+            old_id = self.inserted.get(old_id)
+            if old_id is None:
+                return None
+        mem = get_memory(old_id)
+        if mem is None or mem.superseded_by is not None:
+            return None
+        return mem
+
+
+async def _write_with_conflict(new_memories: list[Memory]) -> WriteReport:
+    report = WriteReport()
+    pool = list_active_memories()
+
+    # 1. 召回：每条新记忆的候选池 = 旧库 + 本批中排在它前面的新记忆
+    cands_per_new: list[list[Candidate]] = []
+    for i, new_mem in enumerate(new_memories):
+        try:
+            cands = find_conflict_candidates(new_mem, pool + new_memories[:i])
+        except Exception as e:
+            logger.warning("召回冲突候选失败 %s: %s", new_mem.memory_id, e)
+            cands = []
+        cands_per_new.append(cands)
+
+    # 2. 整批一次判定；任何异常都退回规则，不丢新记忆
+    all_cands = [c for cands in cands_per_new for c in cands]
+    relations: list[Relation] = []
+    if all_cands:
+        try:
+            relations = list(await judge_relations(all_cands))
+            if len(relations) != len(all_cands):
+                raise ValueError("判定结果数量与候选不一致")
+        except Exception as e:
+            logger.warning("关系判定失败，退回规则: %s", e)
+            relations = []
+        if not relations:
+            relations = [_safe_rule(c) for c in all_cands]
+
+    # 3. 逐条处置
+    state = _BatchState({m.memory_id for m in new_memories})
+    offset = 0
+    for new_mem, cands in zip(new_memories, cands_per_new):
+        pairs = list(zip(cands, relations[offset:offset + len(cands)]))
+        offset += len(cands)
+        try:
+            await _process_one(new_mem, pairs, state, report)
+        except Exception as e:
+            logger.warning("写入记忆 %s 失败: %s", new_mem.memory_id, e)
+            report.failed += 1
+    return report
+
+
+def _safe_rule(c: Candidate) -> Relation:
+    try:
+        return judge_by_rules(c)
+    except Exception:
+        return Relation(
+            new_id=c.new.memory_id, old_id=c.old.memory_id, relation="unrelated",
+            similarity=c.similarity, judged_by="rule", reason="规则判定失败",
+        )
+
+
+def _insert(new_mem: Memory, state: _BatchState, report: WriteReport) -> str:
+    insert_memory(new_mem)
+    report.inserted += 1
+    state.inserted[new_mem.memory_id] = new_mem.memory_id
+    return new_mem.memory_id
+
+
+async def _process_one(
+    new_mem: Memory,
+    pairs: list[tuple[Candidate, Relation]],
+    state: _BatchState,
+    report: WriteReport,
+) -> None:
+    orig_id = new_mem.memory_id
+
+    # 过滤：old 已不在库（被吸收/已覆盖）的关系忽略；unrelated 只记日志
+    actionable: list[tuple[Relation, Memory]] = []
+    for cand, rel in pairs:
+        old = state.resolve_old(rel.old_id)
+        if old is None:
+            _log_judgment(rel, new_mem, cand.old, note="忽略：旧记忆已不在库中")
+            continue
+        if rel.relation == "unrelated":
+            _log_judgment(rel, new_mem, old)
+            continue
+        if rel.relation == "duplicate" and (
+            old.type != new_mem.type
+            or (new_mem.type == "episodic" and not config.EPISODIC_DEDUP_ENABLED)
+        ):
+            _log_judgment(rel, new_mem, old, note="重复但不吸收，按无关处理")
+            continue
+        actionable.append((rel, old))
+
+    if not actionable:
+        _insert(new_mem, state, report)
+        return
+
+    # duplicate 优先：取相似度最高的一条，其余关系忽略
+    dups = [x for x in actionable if x[0].relation == "duplicate"]
+    if dups:
+        rel, old = max(dups, key=lambda x: x[0].similarity)
+        _log_judgment(rel, new_mem, old)
+        _handle_duplicate(new_mem, old, report)
+        return
+
+    actionable.sort(key=lambda x: x[0].similarity, reverse=True)
+    nt = new_mem.type
+
+    # refine 合并：semantic/procedural 取第一条带 merged 的
+    merge_pair = None
+    final_mem = new_mem
+    merge_guard_fail: str | None = None
+    for rel, old in actionable:
+        if (rel.relation == "refine" and nt in ("semantic", "procedural")
+                and old.type == nt and rel.merged and rel.merged.strip()):
+            merge_pair = (rel, old)
+            break
+    if merge_pair is not None:
+        rel, old = merge_pair
+        merge_guard_fail = _guard_failure(new_mem, old, skip_access=(nt == "procedural"))
+        if merge_guard_fail is None:
+            try:
+                emb = await embed_text(rel.merged)
+                final_mem = replace(
+                    new_mem, memory_id=str(uuid.uuid4()), content=rel.merged, embedding=emb,
+                )
+            except Exception as e:
+                logger.warning("refine 合并文本 embedding 失败，原样插入: %s", e)
+                merge_pair = None
+                _log_judgment(rel, new_mem, old, note="合并 embedding 失败，原文插入")
+        # 守卫失败：原文插入 + pending contradict，在下面逐对处置里处理
+
+    need_insert = any(
+        not (rel.relation == "refine" and nt == "emotional") for rel, _ in actionable
+    )
+    final_id: str | None = None
+    if need_insert:
+        insert_memory(final_mem)
+        report.inserted += 1
+        final_id = final_mem.memory_id
+        state.inserted[orig_id] = final_id
+
+    for rel, old in actionable:
+        if merge_pair is not None and rel is merge_pair[0]:
+            if merge_guard_fail is not None:
+                _pending(final_id, old, rel, new_mem, "contradict", merge_guard_fail, report)
+            else:
+                n = supersede_and_archive([old.memory_id], final_id)
+                _link(final_id, old.memory_id, rel, "refine", "resolved", rel.subtype)
+                _log_judgment(rel, new_mem, old, verb="合并覆盖")
+                report.refined += 1
+                report.superseded += n
+            continue
+        _apply_pair(new_mem, final_id, rel, old, report)
+
+
+def _handle_duplicate(new_mem: Memory, old: Memory, report: WriteReport) -> None:
+    """duplicate：semantic/procedural 只计访问；emotional/episodic 沿用强化。"""
+    t = new_mem.type
+    if t in ("semantic", "procedural"):
+        mark_accessed([old.memory_id])
+        if config.ACCESS_LOG_ENABLED:
+            log_access_event(old.memory_id, "dedup")
+        report.deduped += 1
+    elif t == "emotional":
+        new_weight = min(1.0, old.decay_weight + EMOTIONAL_REINFORCE_BOOST)
+        reinforce_memory(
+            old.memory_id, new_weight, max(old.arousal, new_mem.arousal),
+            list(set(old.tags + new_mem.tags)),
+        )
+        report.reinforced += 1
+    else:
+        new_weight = min(1.0, old.decay_weight + EPISODIC_REINFORCE_BOOST)
+        reinforce_memory(
+            old.memory_id, new_weight, old.arousal, list(set(old.tags + new_mem.tags)),
+        )
+        report.reinforced += 1
+
+
+def _pending(
+    final_id: str, old: Memory, rel: Relation, new_mem: Memory,
+    relation: str, reason: str | None, report: WriteReport, tag: str | None = None,
+) -> None:
+    """两条都留，写 pending 关系。reason 为守卫失败原因或判定理由。"""
+    _link(final_id, old.memory_id, rel, relation, "pending", rel.subtype)
+    if tag is None and rel.relation == "contradict" and reason == rel.reason:
+        _log_judgment(rel, new_mem, old, verb="挂起")
+    else:
+        _log_judgment(rel, new_mem, old, verb="挂起", tag=tag or f"{rel.relation}→pending",
+                      note=reason)
+    report.conflicted += 1
+
+
+def _overwrite(
+    new_mem: Memory, final_id: str, rel: Relation, old: Memory, relation: str,
+    subtype: str | None, report: WriteReport,
+) -> None:
+    """受守卫约束的覆盖归档；守卫失败则挂起。"""
+    reason = _guard_failure(new_mem, old, skip_access=(new_mem.type == "procedural"))
+    if reason:
+        _pending(final_id, old, rel, new_mem, relation, reason, report)
+        return
+    n = supersede_and_archive([old.memory_id], final_id)
+    _link(final_id, old.memory_id, rel, relation, "resolved", subtype)
+    _log_judgment(rel, new_mem, old, verb="覆盖")
+    report.updated += 1
+    report.superseded += n
+
+
+def _apply_pair(
+    new_mem: Memory, final_id: str | None, rel: Relation, old: Memory, report: WriteReport,
+) -> None:
+    """按处置矩阵处理单个 (新, 旧) 关系；新记忆已按需插入（final_id）。"""
+    nt, ot, r = new_mem.type, old.type, rel.relation
+    if r == "contradict" and nt in ("procedural", "emotional"):
+        r = "update"
+
+    # 跨类型
+    if nt == "semantic" and ot == "episodic":
+        _link(final_id, old.memory_id, rel, r, "resolved", rel.subtype)
+        _log_judgment(rel, new_mem, old, note=f"跨类型只记关系：{rel.reason or ''}")
+        return
+    if nt == "episodic" and ot == "semantic":
+        if r == "update":
+            _overwrite(new_mem, final_id, rel, old, "update", None, report)
+        elif r == "refine":
+            _link(final_id, old.memory_id, rel, "refine", "resolved", None)
+            _log_judgment(rel, new_mem, old)
+            report.refined += 1
+        else:  # contradict
+            _pending(final_id, old, rel, new_mem, "contradict", rel.reason, report)
+        return
+
+    if r == "refine":
+        if nt == "emotional":
+            new_weight = min(1.0, old.decay_weight + EMOTIONAL_REINFORCE_BOOST)
+            reinforce_memory(
+                old.memory_id, new_weight, max(old.arousal, new_mem.arousal),
+                list(set(old.tags + new_mem.tags)),
+            )
+            report.reinforced += 1
+        else:
+            _link(final_id, old.memory_id, rel, "refine", "resolved", None)
+        _log_judgment(rel, new_mem, old)
+        report.refined += 1
+    elif r == "update":
+        if nt == "emotional":
+            scale_decay_weight(old.memory_id, config.EMOTIONAL_FLIP_DAMPING)
+            _link(final_id, old.memory_id, rel, "update", "resolved", "flip")
+            _log_judgment(rel, new_mem, old, verb="降权")
+            report.damped += 1
+        elif nt == "episodic" and rel.subtype == "followup":
+            clear_unresolved(old.memory_id)
+            _link(final_id, old.memory_id, rel, "update", "resolved", "followup")
+            _log_judgment(rel, new_mem, old, verb="进展")
+            report.updated += 1
+        else:
+            subtype = "correction" if nt == "episodic" else rel.subtype
+            _overwrite(new_mem, final_id, rel, old, "update", subtype, report)
+    else:  # contradict：semantic / episodic
+        _pending(final_id, old, rel, new_mem, "contradict", rel.reason, report)

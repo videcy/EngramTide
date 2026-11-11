@@ -404,3 +404,50 @@ def fake_embedding(monkeypatch):
     monkeypatch.setattr(dehydrator_mod, "embed_text", _fake_embed)
     # also patch consolidator's embed_text
     monkeypatch.setattr("core.consolidator.embed_text", _fake_embed)
+
+
+# ── 冲突相关 ──────────────────────────────────────────────
+
+
+class TestConflictAware:
+    def test_pending_pair_excluded_from_candidates(self):
+        from core.consolidator import find_merge_candidates_capped
+        from core.memory_store import insert_link, insert_memories
+        emb = np.array([1.0, 0.0], dtype=np.float32)
+        a = _make_mem("episodic", "事件A", emb)
+        b = _make_mem("episodic", "事件A'", emb)
+        c = _make_mem("episodic", "事件C", emb)
+        insert_memories([a, b, c])
+        insert_link(a.memory_id, "other", "contradict", judged_by="rule", status="pending")
+        pairs, _ = find_merge_candidates_capped([a, b, c])
+        ids = {m.memory_id for p in pairs for m in p[:2]}
+        assert a.memory_id not in ids
+        assert ids == {b.memory_id, c.memory_id}
+
+    def test_resolved_link_not_excluded(self):
+        from core.consolidator import find_merge_candidates_capped
+        from core.memory_store import insert_link, insert_memories
+        emb = np.array([1.0, 0.0], dtype=np.float32)
+        a = _make_mem("episodic", "事件A", emb)
+        b = _make_mem("episodic", "事件A'", emb)
+        insert_memories([a, b])
+        insert_link(a.memory_id, b.memory_id, "duplicate", judged_by="rule", status="resolved")
+        pairs, _ = find_merge_candidates_capped([a, b])
+        assert len(pairs) == 1
+
+    @pytest.mark.asyncio
+    async def test_conflict_reply_counts_as_skipped(self, monkeypatch, fake_embedding):
+        from core.consolidator import consolidate_memories
+        from core.memory_store import insert_memories
+        emb = np.array([1.0, 0.0], dtype=np.float32)
+        insert_memories([_make_mem("episodic", "事件A", emb), _make_mem("episodic", "事件B", emb)])
+
+        async def _fake_merge(a, b, t):
+            return " CONFLICT\n"
+
+        monkeypatch.setattr("core.consolidator._llm_merge_pair", _fake_merge)
+        report = await consolidate_memories()
+        assert report.candidates == 1
+        assert report.skipped == 1
+        assert report.merged == 0
+        assert len(list_active_memories()) == 2

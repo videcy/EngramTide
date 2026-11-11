@@ -181,3 +181,57 @@ async def test_apply_clears_stale_unresolved(monkeypatch):
 
     rows = {m.content: m.unresolved for m in memory_store.list_active_memories()}
     assert rows == {"我明天要问她旧事": False, "我答应周末提醒她": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("llm_judge", [False, True])
+async def test_apply_sets_origin_and_toggles_llm_judge(monkeypatch, llm_judge):
+    import config
+
+    async def fake_embed(_text):
+        return np.ones(64, dtype=np.float32)
+
+    seen = []
+
+    async def fake_write(memories):
+        seen.append(config.CONFLICT_LLM_JUDGE_ENABLED)
+        for m in memories:
+            memory_store.insert_memory(m)
+
+        class R:
+            inserted = len(memories)
+            superseded = reinforced = deduped = failed = 0
+
+        return R()
+
+    monkeypatch.setattr(import_diary, "embed_text", fake_embed)
+    monkeypatch.setattr(import_diary, "write_memories", fake_write)
+    monkeypatch.setattr(config, "CONFLICT_LLM_JUDGE_ENABLED", True)
+
+    summary = await import_diary.apply_plan(
+        make_plan([plan_entry("diary:x", "2026-09-28 04:00:00", [mem("用户住在北京", "semantic")])]),
+        now=datetime(2026, 10, 8, 4, 0, tzinfo=timezone.utc),
+        llm_judge=llm_judge,
+    )
+
+    assert seen == [llm_judge]
+    assert config.CONFLICT_LLM_JUDGE_ENABLED is True  # 结束后恢复
+    assert summary["conflicted"] == 0 and summary["updated"] == 0
+    [row] = memory_store.list_active_memories()
+    assert row.origin == "import"
+
+
+def test_llm_judge_flag_parsed():
+    parser_args = []
+
+    async def fake_cmd(args):
+        parser_args.append(args.llm_judge)
+        return 0
+
+    import_diary.cmd_apply, orig = fake_cmd, import_diary.cmd_apply
+    try:
+        import_diary.main(["apply", "plan.json"])
+        import_diary.main(["apply", "plan.json", "--llm-judge"])
+    finally:
+        import_diary.cmd_apply = orig
+    assert parser_args == [False, True]
