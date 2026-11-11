@@ -54,6 +54,7 @@ from core.consolidator import (
     maybe_auto_consolidate,
 )
 from core.dehydrator import dehydrate_conversation
+from engramtide.service import MemoryService
 
 # ── 日志配置 ──────────────────────────────────────────────
 
@@ -93,6 +94,9 @@ WELCOME = r"""
   /debug retrieval    查看检索分数分解
   /debug context      查看 token 预算用量
   /stats              查看记忆规模与净增长
+  /conflicts          列出挂起的新旧记忆冲突
+  /conflicts resolve <编号> <new|old|both>  处理冲突（保留新/旧/两条）
+  /debug conflicts    查看最近一次写入的冲突判定明细
   /maintenance        立即执行归档与埋点清理
   /archive <关键词>   翻查已归档的记忆
 """
@@ -139,12 +143,30 @@ def _print_stats() -> None:
         f"  → 净增长 {st['net_growth_last_30d']:+,}"
     )
     print(
+        f"挂起冲突    {st.get('pending_conflicts', 0):>6,}"
+        f"   关系记录 {st.get('memory_links', 0):,}"
+    )
+    print(
         f"埋点事件    decay {st['decay_events']:,} / access {st['access_events']:,}"
     )
     print(
         f"DB 体积     {_fmt_bytes(st['db_bytes'])}"
         f"   FTS5 索引: {'启用' if st['fts_enabled'] else '未启用'}\n"
     )
+
+
+def _print_conflicts() -> None:
+    """列出挂起的冲突。编号即 link_id，给 /conflicts resolve 用。"""
+    items = MemoryService.list_conflicts("pending", 20)
+    if not items:
+        print("（没有挂起的冲突）")
+        return
+    print(f"\n--- 挂起冲突（共 {len(items)} 条）---")
+    for it in items:
+        print(f"  #{it['link_id']} [{it['relation']}] {it['reason'] or ''}")
+        print(f"      新: {it['new']['content']}  ({it['new']['created_at']})")
+        print(f"      旧: {it['old']['content']}  ({it['old']['created_at']})")
+    print()
 
 
 # ── 主循环 ────────────────────────────────────────────────
@@ -314,6 +336,32 @@ async def main_loop() -> None:
                           f"收录 {info['included']} 条, 丢弃 {info['dropped']} 条")
                 else:
                     print("（本会话尚无上下文构建记录）")
+                continue
+
+            if user_input == "/debug conflicts":
+                import core.memory_writer as memory_writer
+
+                judgments = getattr(memory_writer, "LAST_JUDGMENTS", None)
+                if judgments:
+                    print("--- 最近一次写入的冲突判定 ---")
+                    for line in judgments:
+                        print(f"  {line}")
+                else:
+                    print("（暂无冲突判定数据）")
+                continue
+
+            if user_input == "/conflicts":
+                _print_conflicts()
+                continue
+
+            if user_input.startswith("/conflicts resolve"):
+                parts = user_input.split()
+                if len(parts) != 4 or not parts[2].isdigit():
+                    print("用法: /conflicts resolve <编号> <new|old|both>")
+                    continue
+                result = MemoryService.resolve_conflict(int(parts[2]), parts[3])
+                print(f"⚠️ {result['error']}" if "error" in result else
+                      f"✅ 已处理冲突 #{parts[2]}（保留 {parts[3]}，归档 {result['archived']} 条）")
                 continue
 
             if user_input == "/stats":
@@ -542,14 +590,23 @@ async def _handle_exit(
                 parts.append(f"去重 {write_report.deduped}")
             if write_report.failed:
                 parts.append(f"失败 {write_report.failed}")
+            for attr, label in (("updated", "更新"), ("refined", "细化"),
+                                ("conflicted", "挂起冲突"), ("damped", "降权")):
+                if getattr(write_report, attr, 0):
+                    parts.append(f"{label} {getattr(write_report, attr)}")
             detail = "、".join(parts) if parts else "无变化"
             logger.info(
-                "写入管线: 插入 %d, 覆盖 %d, 强化 %d, 去重 %d, 失败 %d",
+                "写入管线: 插入 %d, 覆盖 %d, 强化 %d, 去重 %d, 失败 %d, "
+                "更新 %d, 细化 %d, 挂起冲突 %d, 降权 %d",
                 write_report.inserted,
                 write_report.superseded,
                 write_report.reinforced,
                 write_report.deduped,
                 write_report.failed,
+                getattr(write_report, "updated", 0),
+                getattr(write_report, "refined", 0),
+                getattr(write_report, "conflicted", 0),
+                getattr(write_report, "damped", 0),
             )
             print(f"✅ 写入完成（{detail}）。")
 

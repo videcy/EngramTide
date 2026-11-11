@@ -254,3 +254,110 @@ def test_render_skips_empty_sections_and_caps_length():
     assert len(capped) <= 120
     assert capped.endswith("\n</m>")
     assert not capped.split("\n")[-2].endswith("经")  # 按行截断，不切半条
+
+
+# ── 冲突处理 ─────────────────────────────────────────────
+
+
+def _conflict_pair(relation: str = "contradict"):
+    memory_store.init_db()
+    old = add_memory(content="用户住在北京")
+    new = add_memory(content="用户住在上海")
+    link_id = memory_store.insert_link(
+        new.memory_id, old.memory_id, relation,
+        judged_by="rule", status="pending", similarity=0.8, reason="居住地不一致",
+    )
+    return old, new, link_id
+
+
+@pytest.mark.asyncio
+async def test_remember_sets_origin_and_reports_new_counts(embed_calls):
+    service = make_service()
+
+    result = await service.remember("用户住在北京", "semantic")
+
+    for key in ("updated", "refined", "conflicted", "damped"):
+        assert result[key] == 0
+    [mem] = memory_store.list_active_memories()
+    assert mem.origin == "remember"
+
+
+def test_list_conflicts_returns_both_sides_and_archive_flag():
+    old, new, link_id = _conflict_pair()
+    memory_store.supersede_and_archive([old.memory_id], new.memory_id)
+
+    [item] = make_service().list_conflicts()
+
+    assert item["link_id"] == link_id
+    assert (item["relation"], item["subtype"], item["reason"], item["similarity"]) == (
+        "contradict", None, "居住地不一致", 0.8
+    )
+    assert item["created_at"]
+    assert item["new"]["content"] == "用户住在上海" and item["new"]["archived"] is False
+    assert item["old"]["content"] == "用户住在北京" and item["old"]["archived"] is True
+    assert item["old"]["id"] == old.memory_id and item["old"]["created_at"] is not None
+    assert make_service().list_conflicts(limit=0) == []
+
+
+@pytest.mark.parametrize("keep,gone", [("new", "old"), ("old", "new"), ("both", None)])
+def test_resolve_conflict_keep(keep, gone):
+    old, new, link_id = _conflict_pair()
+    service = make_service()
+
+    result = service.resolve_conflict(link_id, keep)
+
+    assert "error" not in result
+    assert memory_store.get_link(link_id).status == "resolved"
+    active = {m.memory_id for m in memory_store.list_active_memories()}
+    expected = {old.memory_id, new.memory_id}
+    if gone:
+        expected.discard({"old": old, "new": new}[gone].memory_id)
+        assert result["archived"] == 1
+    assert active == expected
+    assert service.list_conflicts() == []
+
+
+def test_resolve_conflict_errors():
+    old, new, link_id = _conflict_pair()
+    service = make_service()
+
+    assert "error" in service.resolve_conflict(9999, "new")
+    assert "error" in service.resolve_conflict(link_id, "bogus")
+    assert memory_store.get_link(link_id).status == "pending"
+
+    memory_store.delete_memories([old.memory_id])
+    other_old, other_new, other_link = _conflict_pair()
+    memory_store.supersede_and_archive([other_old.memory_id], other_new.memory_id)
+    assert "error" in service.resolve_conflict(other_link, "new")  # 目标已不在热表
+    assert memory_store.get_link(other_link).status == "pending"
+
+    third_old, third_new, third_link = _conflict_pair()
+    assert "error" not in service.resolve_conflict(third_link, "both")
+    assert "error" in service.resolve_conflict(third_link, "both")  # 已 resolved
+
+
+def test_undo_supersede_round_trip():
+    old, new, link_id = _conflict_pair("update")
+    service = make_service()
+    service.resolve_conflict(link_id, "new")
+    assert {m.memory_id for m in memory_store.list_active_memories()} == {new.memory_id}
+
+    result = service.undo_supersede(old.memory_id)
+
+    assert result["restored"] == 1 and result["links_reopened"] == [link_id]
+    assert {m.memory_id for m in memory_store.list_active_memories()} == {
+        old.memory_id, new.memory_id
+    }
+    assert memory_store.get_memory(old.memory_id).superseded_by is None
+    assert memory_store.get_link(link_id).status == "pending"
+
+
+def test_undo_supersede_errors():
+    service = make_service()
+    plain = add_memory()
+    assert "error" in service.undo_supersede(plain.memory_id)  # 在热表
+    assert "error" in service.undo_supersede("nope")  # 不存在
+
+    archived = add_memory(content="普通归档")
+    memory_store.archive_memories([archived.memory_id])
+    assert "error" in service.undo_supersede(archived.memory_id)  # 无冲突关系

@@ -182,6 +182,30 @@ async def restore_archived(memory_ids: list[str]) -> dict[str, int]:
 
 
 @mcp.tool()
+async def resolve_conflict(
+    link_id: int, keep: Literal["new", "old", "both"]
+) -> dict[str, Any]:
+    """Resolve one pending memory conflict. MODIFIES DATA; confirm with the user first.
+
+    keep="new": the newer memory stays, the older one is superseded and archived.
+    keep="old": the older memory stays, the newer one is archived.
+    keep="both": keep both, just mark the conflict resolved.
+    Returns {"error": ...} if the link is missing/already resolved or a memory is gone.
+    """
+    return get_service().resolve_conflict(link_id, keep)
+
+
+@mcp.tool()
+async def undo_supersede(memory_id: str) -> dict[str, Any]:
+    """Restore a memory that was archived by conflict handling. MODIFIES DATA.
+
+    Moves it back to active memory and reopens its conflict as pending.
+    Returns {"error": ...} if it is not an archived, conflict-superseded memory.
+    """
+    return get_service().undo_supersede(memory_id)
+
+
+@mcp.tool()
 async def run_maintenance() -> dict[str, Any]:
     """Run archiving, superseded purge, event-log and buffer retention right now."""
     return get_service().run_maintenance()
@@ -210,8 +234,19 @@ async def export_memories() -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def memory_stats() -> dict[str, Any]:
-    """Counts by type, 30-day net growth, DB size, and sessions awaiting dehydration."""
+    """Counts by type, 30-day net growth, DB size, pending conflicts, link count, and sessions awaiting dehydration."""
     return get_service().stats()
+
+
+@mcp.tool()
+async def list_conflicts(status: str = "pending", limit: int = 20) -> list[dict[str, Any]]:
+    """List memory conflicts (default: pending) with both memories' content and time.
+
+    Read-only. Each item has link_id, relation, subtype, reason, similarity,
+    created_at, and new/old = {id, content, created_at, archived}. Use
+    resolve_conflict with a link_id to settle one.
+    """
+    return get_service().list_conflicts(status, limit)
 
 
 @mcp.tool()

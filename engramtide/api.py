@@ -254,6 +254,7 @@ class EngramTide:
             source_conv_id=source_conv_id,
             unresolved=unresolved,
             tags=[t.strip() for t in tags if t.strip()],
+            origin="remember",
         )
         return await write_memories([memory])
 
