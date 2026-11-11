@@ -144,6 +144,34 @@ EPISODIC_DEDUP_ENABLED: bool = (
 )
 EPISODIC_REINFORCE_BOOST: float = 0.1        # episodic 近重复命中时的 decay_weight 提升量
 
+# ── 新旧记忆冲突处理 ──────────────────────────────────────
+# 总开关关闭时，写入管线与引入冲突处理之前逐字段一致。
+
+CONFLICT_DETECT_ENABLED: bool = (
+    _get_env("CONFLICT_DETECT_ENABLED", "true").lower() != "false"
+)
+CONFLICT_LLM_JUDGE_ENABLED: bool = (
+    _get_env("CONFLICT_LLM_JUDGE_ENABLED", "true").lower() != "false"
+)                                       # 关闭后只用规则判定，写入零额外 LLM 调用
+CONFLICT_CANDIDATE_MIN: float = float(
+    _get_env("CONFLICT_CANDIDATE_MIN", "") or _get_env("SIMILARITY_HIGH", "0.56") or "0.56"
+)                                       # 候选召回下界，默认跟随 SIMILARITY_HIGH
+CONFLICT_TOP_K: int = int(_get_env("CONFLICT_TOP_K", "3") or "3")
+CONFLICT_MAX_PAIRS: int = int(_get_env("CONFLICT_MAX_PAIRS", "40") or "40")
+CONFLICT_JUDGE_MAX_TOKENS: int = int(
+    _get_env("CONFLICT_JUDGE_MAX_TOKENS", "4096") or "4096"
+)
+CONFLICT_PROTECT_ACCESS: int = int(
+    _get_env("CONFLICT_PROTECT_ACCESS", "5") or "5"
+)                                       # 旧记忆访问次数达到该值时不自动覆盖（procedural 除外）
+EMOTIONAL_FLIP_DAMPING: float = float(
+    _get_env("EMOTIONAL_FLIP_DAMPING", "0.5") or "0.5"
+)                                       # 态度反转时旧 emotional 的 decay_weight 乘数
+CONFLICT_SURFACE_MAX: int = int(_get_env("CONFLICT_SURFACE_MAX", "2") or "2")
+CONFLICT_PENDING_EXPIRE_DAYS: int = int(
+    _get_env("CONFLICT_PENDING_EXPIRE_DAYS", "30") or "30"
+)                                       # 挂起冲突超过该天数无人处理时以较新的为准；<0 关闭
+
 
 # ── Context-Aware 激活参数（Phase 3）────────────────────────
 
@@ -325,6 +353,19 @@ def check_config() -> list[str]:
             f"激活阈值分层非法：要求 0 < SIMILARITY_MID < SIMILARITY_HIGH <= 1，"
             f"当前 MID={SIMILARITY_MID}、HIGH={SIMILARITY_HIGH}。\n"
             f"  MID >= HIGH 会使轻激活带 (MID, HIGH] 为空集，轻激活机制失效。"
+        )
+
+    write_thresholds = {
+        "SEMANTIC_OVERRIDE_THRESHOLD": SEMANTIC_OVERRIDE_THRESHOLD,
+        "EMOTIONAL_REINFORCE_THRESHOLD": EMOTIONAL_REINFORCE_THRESHOLD,
+        "PROCEDURAL_DEDUP_THRESHOLD": PROCEDURAL_DEDUP_THRESHOLD,
+        "EPISODIC_DEDUP_THRESHOLD": EPISODIC_DEDUP_THRESHOLD,
+    }
+    too_high = [k for k, v in write_thresholds.items() if CONFLICT_CANDIDATE_MIN > v]
+    if too_high:
+        errors.append(
+            f"CONFLICT_CANDIDATE_MIN={CONFLICT_CANDIDATE_MIN} 高于写入阈值 {', '.join(too_high)}。\n"
+            f"  召回下界必须不高于各类型写入阈值，否则过阈值的重复对会漏检。"
         )
 
     if not (0 < HOOK_MAX_CONTEXT_CHARS <= 10_000):

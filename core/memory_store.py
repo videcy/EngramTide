@@ -42,6 +42,24 @@ class Memory:
     unresolved: bool = False
     tags: list[str] = field(default_factory=list)
     superseded_by: str | None = None
+    origin: str = "dehydrate"  # dehydrate / remember / import / consolidate
+
+
+@dataclass
+class MemoryLink:
+    """两条记忆之间的关系记录（memory_links 表的一行）。"""
+
+    id: int
+    src_id: str
+    dst_id: str
+    relation: str
+    subtype: str | None
+    similarity: float | None
+    judged_by: str
+    reason: str | None
+    status: str
+    created_at: str
+    resolved_at: str | None
 
 
 # ── SQL ───────────────────────────────────────────────────
@@ -61,7 +79,8 @@ CREATE TABLE IF NOT EXISTS memories (
     source_conv_id  TEXT,
     unresolved      BOOLEAN DEFAULT FALSE,
     tags            TEXT DEFAULT '',
-    superseded_by   TEXT DEFAULT NULL
+    superseded_by   TEXT DEFAULT NULL,
+    origin          TEXT DEFAULT 'dehydrate'
 );
 """
 
@@ -82,6 +101,28 @@ DROP_LEGACY_INDEXES_SQL = (
     "DROP INDEX IF EXISTS idx_memories_unresolved;",
 )
 
+# 冲突处理的关系表。duplicate / unrelated 不写，避免表随写入量线性增长。
+CREATE_LINKS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS memory_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_id      TEXT NOT NULL,
+    dst_id      TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    subtype     TEXT,
+    similarity  REAL,
+    judged_by   TEXT NOT NULL,
+    reason      TEXT,
+    status      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    resolved_at TEXT
+);
+"""
+
+CREATE_LINKS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_links_pending
+    ON memory_links(status, src_id, dst_id);
+"""
+
 # 归档表：列与 memories 完全一致，额外记 archived_at。
 # 归档不是删除——数据仍在，只是移出热路径（不进 list_active_memories、不进向量矩阵）。
 CREATE_ARCHIVE_TABLE_SQL = """
@@ -100,6 +141,7 @@ CREATE TABLE IF NOT EXISTS memories_archive (
     unresolved      BOOLEAN DEFAULT FALSE,
     tags            TEXT DEFAULT '',
     superseded_by   TEXT DEFAULT NULL,
+    origin          TEXT DEFAULT 'dehydrate',
     archived_at     TEXT NOT NULL
 );
 """
@@ -107,16 +149,16 @@ CREATE TABLE IF NOT EXISTS memories_archive (
 _MEMORY_COLUMNS = (
     "memory_id, type, content, valence, arousal, "
     "created_at, last_accessed, access_count, decay_weight, embedding, "
-    "source_conv_id, unresolved, tags, superseded_by"
+    "source_conv_id, unresolved, tags, superseded_by, origin"
 )
 
 INSERT_SQL = """
 INSERT INTO memories
     (memory_id, type, content, valence, arousal,
      access_count, decay_weight, embedding, source_conv_id,
-     unresolved, tags, superseded_by)
+     unresolved, tags, superseded_by, origin)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 INSERT_WITH_TIME_SQL = """
@@ -124,9 +166,9 @@ INSERT INTO memories
     (memory_id, type, content, valence, arousal,
      created_at, last_accessed,
      access_count, decay_weight, embedding, source_conv_id,
-     unresolved, tags, superseded_by)
+     unresolved, tags, superseded_by, origin)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 SELECT_ACTIVE_SQL = """
@@ -134,7 +176,7 @@ SELECT
     memory_id, type, content, valence, arousal,
     created_at, last_accessed, access_count,
     decay_weight, embedding, source_conv_id,
-    unresolved, tags, superseded_by
+    unresolved, tags, superseded_by, origin
 FROM memories
 WHERE superseded_by IS NULL
 ORDER BY created_at DESC;
@@ -145,7 +187,7 @@ SELECT
     memory_id, type, content, valence, arousal,
     created_at, last_accessed, access_count,
     decay_weight, embedding, source_conv_id,
-    unresolved, tags, superseded_by
+    unresolved, tags, superseded_by, origin
 FROM memories
 WHERE superseded_by IS NULL
 ORDER BY created_at DESC
@@ -157,7 +199,7 @@ SELECT
     memory_id, type, content, valence, arousal,
     created_at, last_accessed, access_count,
     decay_weight, embedding, source_conv_id,
-    unresolved, tags, superseded_by
+    unresolved, tags, superseded_by, origin
 FROM memories
 WHERE memory_id = ?;
 """
@@ -361,6 +403,10 @@ def init_db() -> None:
     # P4 归档表
     conn.execute(CREATE_ARCHIVE_TABLE_SQL)
 
+    # 冲突关系表
+    conn.execute(CREATE_LINKS_TABLE_SQL)
+    conn.execute(CREATE_LINKS_INDEX_SQL)
+
     # Phase 5 日志表 + P0 保留期清理所需的 ts 索引
     conn.execute(CREATE_DECAY_EVENTS_SQL)
     conn.execute(CREATE_ACCESS_EVENTS_SQL)
@@ -421,6 +467,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             "UPDATE memories SET superseded_at = ? WHERE superseded_by IS NOT NULL;",
             (utc_now().isoformat(),),
         )
+    # origin：记忆来源，存量数据按默认值 dehydrate 处理（热表、归档表都要补）
+    for table in ("memories", "memories_archive"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table});")}
+        if cols and "origin" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN origin TEXT DEFAULT 'dehydrate';"
+            )
 
 
 def _init_fts(conn: sqlite3.Connection) -> bool:
@@ -593,6 +646,7 @@ def insert_memory(memory: Memory) -> None:
                 int(memory.unresolved),
                 ",".join(memory.tags),
                 memory.superseded_by,
+                memory.origin,
             ),
         )
     else:
@@ -611,6 +665,7 @@ def insert_memory(memory: Memory) -> None:
                 int(memory.unresolved),
                 ",".join(memory.tags),
                 memory.superseded_by,
+                memory.origin,
             ),
         )
     conn.commit()
@@ -638,6 +693,7 @@ def _insert_params(memory: Memory, with_time: bool) -> tuple:
         int(memory.unresolved),
         ",".join(memory.tags),
         memory.superseded_by,
+        memory.origin,
     )
     return head + times + tail
 
@@ -723,6 +779,11 @@ def delete_memories(memory_ids: list[str]) -> int:
         conn.execute(
             f"DELETE FROM access_events WHERE memory_id IN ({placeholders})",
             unique_ids,
+        )
+        conn.execute(
+            f"DELETE FROM memory_links WHERE src_id IN ({placeholders}) "
+            f"OR dst_id IN ({placeholders})",
+            unique_ids + unique_ids,
         )
         cursor = conn.execute(
             f"DELETE FROM memories WHERE memory_id IN ({placeholders})",
@@ -832,6 +893,7 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         unresolved=bool(row["unresolved"]),
         tags=tags,
         superseded_by=row["superseded_by"],
+        origin=row["origin"] or "dehydrate",
     )
 
 
@@ -1182,8 +1244,12 @@ def list_archived_memories(limit: int | None = None) -> list[Memory]:
     return [_row_to_memory(r) for r in rows]
 
 
-def restore_archived(memory_ids: list[str]) -> int:
-    """把归档记忆搬回热表（显式召回用）。返回恢复条数。"""
+def restore_archived(memory_ids: list[str], clear_superseded: bool = False) -> int:
+    """
+    把归档记忆搬回热表（显式召回用）。返回恢复条数。
+
+    clear_superseded=True：恢复后清空 superseded_by / superseded_at（撤销覆盖用）。
+    """
     unique_ids = list(dict.fromkeys(mid for mid in memory_ids if mid))
     if not unique_ids:
         return 0
@@ -1201,8 +1267,144 @@ def restore_archived(memory_ids: list[str]) -> int:
             f"DELETE FROM memories_archive WHERE memory_id IN ({placeholders})",
             unique_ids,
         )
+        if clear_superseded:
+            conn.execute(
+                "UPDATE memories SET superseded_by = NULL, superseded_at = NULL "
+                f"WHERE memory_id IN ({placeholders})",
+                unique_ids,
+            )
     _bump_data_version()
     return restored
+
+
+def supersede_and_archive(old_ids: list[str], new_id: str) -> int:
+    """冲突覆盖：标记旧记忆被 new_id 取代并立即归档（可恢复）。返回归档条数。"""
+    if not old_ids:
+        return 0
+    mark_superseded(old_ids, new_id)
+    return archive_memories(old_ids)
+
+
+def scale_decay_weight(memory_id: str, factor: float) -> None:
+    """decay_weight 乘以 factor，结果 clamp 到 [0, 1]。"""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE memories SET decay_weight = MIN(1.0, MAX(0.0, decay_weight * ?)) "
+        "WHERE memory_id = ?",
+        (factor, memory_id),
+    )
+    conn.commit()
+    _bump_data_version()
+
+
+def clear_unresolved(memory_id: str) -> None:
+    """把记忆的 unresolved 标记清掉。"""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE memories SET unresolved = 0 WHERE memory_id = ?", (memory_id,)
+    )
+    conn.commit()
+    _bump_data_version()
+
+
+# ── 冲突关系表 ────────────────────────────────────────────
+
+_LINK_COLUMNS = (
+    "id, src_id, dst_id, relation, subtype, similarity, judged_by, reason, "
+    "status, created_at, resolved_at"
+)
+
+
+def _row_to_link(row: sqlite3.Row) -> MemoryLink:
+    return MemoryLink(**{k: row[k] for k in row.keys()})
+
+
+def insert_link(
+    src_id: str,
+    dst_id: str,
+    relation: str,
+    *,
+    judged_by: str,
+    status: str,
+    subtype: str | None = None,
+    similarity: float | None = None,
+    reason: str | None = None,
+    now=None,
+) -> int:
+    """写一条关系记录，返回自增 id。status='resolved' 时同时填 resolved_at。"""
+    ts = (now or utc_now()).isoformat()
+    resolved_at = ts if status == "resolved" else None
+    conn = _get_conn()
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO memory_links "
+            "(src_id, dst_id, relation, subtype, similarity, judged_by, reason, "
+            " status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (src_id, dst_id, relation, subtype, similarity, judged_by, reason,
+             status, ts, resolved_at),
+        )
+    _bump_data_version()
+    return cursor.lastrowid
+
+
+def get_link(link_id: int) -> MemoryLink | None:
+    conn = _get_conn()
+    row = conn.execute(
+        f"SELECT {_LINK_COLUMNS} FROM memory_links WHERE id = ?", (link_id,)
+    ).fetchone()
+    return _row_to_link(row) if row else None
+
+
+def update_link_status(link_id: int, status: str, now=None) -> bool:
+    """改关系状态：resolved 写 resolved_at，pending 清空。返回是否命中。"""
+    resolved_at = (now or utc_now()).isoformat() if status == "resolved" else None
+    conn = _get_conn()
+    with conn:
+        cursor = conn.execute(
+            "UPDATE memory_links SET status = ?, resolved_at = ? WHERE id = ?",
+            (status, resolved_at, link_id),
+        )
+    _bump_data_version()
+    return cursor.rowcount > 0
+
+
+def list_pending_links(limit: int | None = None) -> list[MemoryLink]:
+    """挂起的关系，新的在前。"""
+    sql = (
+        f"SELECT {_LINK_COLUMNS} FROM memory_links WHERE status = 'pending' "
+        "ORDER BY created_at DESC, id DESC"
+    )
+    conn = _get_conn()
+    if limit is not None:
+        rows = conn.execute(sql + " LIMIT ?", (limit,)).fetchall()
+    else:
+        rows = conn.execute(sql).fetchall()
+    return [_row_to_link(r) for r in rows]
+
+
+def links_for(memory_ids: list[str]) -> list[MemoryLink]:
+    """src 或 dst 命中任一 id 的关系（任何状态），按 id 升序。"""
+    ids = list(dict.fromkeys(mid for mid in memory_ids if mid))
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    conn = _get_conn()
+    rows = conn.execute(
+        f"SELECT {_LINK_COLUMNS} FROM memory_links "
+        f"WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders}) "
+        "ORDER BY id",
+        ids + ids,
+    ).fetchall()
+    return [_row_to_link(r) for r in rows]
+
+
+def pending_link_memory_ids() -> set[str]:
+    """所有 pending 关系涉及的 src/dst id。"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT src_id, dst_id FROM memory_links WHERE status = 'pending'"
+    ).fetchall()
+    return {r["src_id"] for r in rows} | {r["dst_id"] for r in rows}
 
 
 def count_active_by_type() -> dict[str, int]:
@@ -1235,6 +1437,10 @@ def memory_stats() -> dict:
     archived_this_month = conn.execute(
         "SELECT COUNT(*) FROM memories_archive WHERE archived_at >= ?", (month_ago,)
     ).fetchone()[0]
+    pending_conflicts = conn.execute(
+        "SELECT COUNT(*) FROM memory_links WHERE status = 'pending'"
+    ).fetchone()[0]
+    memory_links = conn.execute("SELECT COUNT(*) FROM memory_links").fetchone()[0]
     decay_events = conn.execute("SELECT COUNT(*) FROM decay_events").fetchone()[0]
     access_events = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
     # 缓冲里是对话原文，体积和隐私都要让用户看得见
@@ -1259,6 +1465,8 @@ def memory_stats() -> dict:
         "new_last_30d": new_this_month,
         "archived_last_30d": archived_this_month,
         "net_growth_last_30d": new_this_month - archived_this_month,
+        "pending_conflicts": pending_conflicts,
+        "memory_links": memory_links,
         "decay_events": decay_events,
         "access_events": access_events,
         "buffered_turns": buffered_turns,
