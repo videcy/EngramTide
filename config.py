@@ -157,10 +157,10 @@ CONFLICT_CANDIDATE_MIN: float = float(
     _get_env("CONFLICT_CANDIDATE_MIN", "") or _get_env("SIMILARITY_HIGH", "0.56") or "0.56"
 )                                       # 候选召回下界，默认跟随 SIMILARITY_HIGH
 CONFLICT_TOP_K: int = int(_get_env("CONFLICT_TOP_K", "3") or "3")
-CONFLICT_MAX_PAIRS: int = int(_get_env("CONFLICT_MAX_PAIRS", "40") or "40")
+CONFLICT_MAX_PAIRS: int = int(_get_env("CONFLICT_MAX_PAIRS", "20") or "20")
 CONFLICT_JUDGE_MAX_TOKENS: int = int(
-    _get_env("CONFLICT_JUDGE_MAX_TOKENS", "4096") or "4096"
-)
+    _get_env("CONFLICT_JUDGE_MAX_TOKENS", "8192") or "8192"
+)                                       # 推理模型要给思考 token 留余量，否则输出会被截空
 CONFLICT_PROTECT_ACCESS: int = int(
     _get_env("CONFLICT_PROTECT_ACCESS", "5") or "5"
 )                                       # 旧记忆访问次数达到该值时不自动覆盖（procedural 除外）

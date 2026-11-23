@@ -194,8 +194,18 @@ async def _call_judge_llm(system_prompt: str, user_prompt: str) -> str | None:
             if response.status_code != 200:
                 logger.warning("冲突判定 LLM 返回 %d: %s", response.status_code, response.text[:200])
                 return None
-            content = response.json()["choices"][0]["message"]["content"].strip()
-            return content or None
+            choice = response.json()["choices"][0]
+            content = (choice["message"].get("content") or "").strip()
+            if not content:
+                # 推理模型的思考 token 会吃掉 max_tokens，输出被截成空串
+                logger.warning(
+                    "冲突判定 LLM 输出为空（finish_reason=%s），回退规则",
+                    choice.get("finish_reason"),
+                )
+                return None
+            if choice.get("finish_reason") == "length":
+                logger.warning("冲突判定 LLM 输出被截断（max_tokens 不够），可能部分回退规则")
+            return content
     except Exception as e:
         logger.warning("冲突判定 LLM 调用失败: %s", e)
         return None
